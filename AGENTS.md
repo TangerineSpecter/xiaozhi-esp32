@@ -89,5 +89,6 @@ The build script changes local `sdkconfig` and build state. Do not assume the bu
 - Code style: `docs/code_style.md`
 - Protocols: `docs/websocket.md`, `docs/mqtt-udp.md`, `docs/mcp-protocol.md`
 - CI matrix: `.github/workflows/build.yml`
+- Waveshare ESP32-S3-Touch-AMOLED-2.16 resources: https://docs.waveshare.net/ESP32-S3-Touch-AMOLED-2.16/Resources-And-Documents
 
 Keep detailed or fast-changing information in those files, not here. Add a nested `AGENTS.md` only when a subsystem needs specialized instructions.
