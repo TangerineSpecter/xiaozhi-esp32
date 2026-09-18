@@ -85,6 +85,19 @@ static const co5300_lcd_init_cmd_t vendor_specific_init[] = {
 // 在waveshare_amoled_1_75类之前添加新的显示类
 class CustomLcdDisplay : public SpiLcdDisplay {
 public:
+    // The board-local character assets are 64x64 PNGs. Render them as a
+    // bottom-centered character instead of inheriting the tiny emoji layout.
+    static constexpr lv_coord_t kEmotionSourceSize = 64;
+    static constexpr lv_coord_t kEmotionImageSize = 216;  // 45% of the 480px display
+    static constexpr lv_coord_t kEmotionBottomMargin = 12;
+    // LVGL keeps the image object's layout size at 64x64 while scaling its
+    // drawing around the center pivot. Move the object up by the overscan so
+    // the scaled drawing, rather than the unscaled object, sits on the bottom.
+    static constexpr lv_coord_t kEmotionScaleOverscan =
+        (kEmotionImageSize - kEmotionSourceSize) / 2;
+    static constexpr uint16_t kEmotionImageScale =
+        static_cast<uint16_t>((kEmotionImageSize * 256) / kEmotionSourceSize);
+
     static void rounder_event_cb(lv_event_t* e) {
         lv_area_t* area = (lv_area_t* )lv_event_get_param(e);
         uint16_t x1 = area->x1;
@@ -121,9 +134,28 @@ public:
         SpiLcdDisplay::SetupUI();
 
         DisplayLockGuard lock(this);
+        // Use the whole screen as the transparent emotion canvas. The status
+        // bar remains on top while the character is anchored to the bottom.
+        lv_obj_set_size(emoji_box_, LV_HOR_RES, LV_VER_RES);
+        lv_obj_align(emoji_box_, LV_ALIGN_TOP_MID, 0, 0);
+        lv_obj_align(emoji_image_, LV_ALIGN_BOTTOM_MID, 0,
+                     -(kEmotionBottomMargin + kEmotionScaleOverscan));
         lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES*  0.1, 0);
         lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES*  0.1, 0);
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+    }
+
+    virtual void SetEmotion(const char* emotion) override {
+        SpiLcdDisplay::SetEmotion(emotion);
+
+        DisplayLockGuard lock(this);
+        if (emoji_image_ == nullptr || lv_obj_has_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN)) {
+            return;
+        }
+
+        lv_image_set_scale(emoji_image_, kEmotionImageScale);
+        lv_obj_align(emoji_image_, LV_ALIGN_BOTTOM_MID, 0,
+                     -(kEmotionBottomMargin + kEmotionScaleOverscan));
     }
 };
 

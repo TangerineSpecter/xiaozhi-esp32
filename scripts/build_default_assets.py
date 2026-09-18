@@ -778,6 +778,12 @@ def get_emoji_collection_path(default_emoji_collection, noto_fonts_path, project
     """
     if not default_emoji_collection:
         return None
+
+    # Board-local collections may be passed as an absolute or existing path.
+    # This keeps custom assets out of managed_components while reusing the
+    # same assets.bin generation pipeline as the bundled collections.
+    if os.path.isdir(default_emoji_collection):
+        return default_emoji_collection
     
     # Special handling for otto-gif collection
     if default_emoji_collection == 'otto-gif':

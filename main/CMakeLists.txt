@@ -366,7 +366,8 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_2_16)
     set(BOARD_DIR "waveshare/esp32-s3-touch-amoled-2.16")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_30_4)
     set(BUILTIN_ICON_FONT font_material_symbols_30_4)
-    set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
+    set(DEFAULT_EMOJI_COLLECTION
+        "${PROJECT_DIR}/main/boards/waveshare/esp32-s3-touch-amoled-2.16/assets/emoji")
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_1_43C)
     set(BOARD_DIR "waveshare/esp32-s3-touch-amoled-1.43c")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
@@ -1306,9 +1307,15 @@ function(build_default_assets_bin)
 
     # Add default emoji collection if defined
     if(DEFAULT_EMOJI_COLLECTION)
-        list(APPEND BUILD_ARGS "--emoji_collection" "${DEFAULT_EMOJI_COLLECTION}")
+        if(IS_ABSOLUTE "${DEFAULT_EMOJI_COLLECTION}")
+            set(DEFAULT_EMOJI_COLLECTION_PATH "${DEFAULT_EMOJI_COLLECTION}")
+        else()
+            set(DEFAULT_EMOJI_COLLECTION_PATH
+                "${NOTO_FONTS_PATH}/png/${DEFAULT_EMOJI_COLLECTION}")
+        endif()
+        list(APPEND BUILD_ARGS "--emoji_collection" "${DEFAULT_EMOJI_COLLECTION_PATH}")
         file(GLOB DEFAULT_EMOJI_FILES CONFIGURE_DEPENDS
-            "${NOTO_FONTS_PATH}/png/${DEFAULT_EMOJI_COLLECTION}/*"
+            "${DEFAULT_EMOJI_COLLECTION_PATH}/*"
         )
         list(APPEND DEFAULT_ASSETS_DEPENDENCIES ${DEFAULT_EMOJI_FILES})
     endif()
