@@ -13,6 +13,8 @@
 #include "i2c_device.h"
 
 #include <esp_log.h>
+#include <esp_system.h>
+#include <esp_timer.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
@@ -22,6 +24,8 @@
 #include <esp_lcd_touch_cst9217.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
+
+#include <atomic>
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch16"
 
@@ -146,11 +150,81 @@ class WaveshareEsp32s3TouchAMOLED2inch16 : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     Pmic* pmic_ = nullptr;
+    Button key3_button_;
     Button boot_button_;
     CustomLcdDisplay* display_;
     CustomBacklight* backlight_;
     esp_io_expander_handle_t io_expander = NULL;
     PowerSaveTimer* power_save_timer_;
+    esp_timer_handle_t emergency_restart_timer_ = nullptr;
+    std::atomic_bool key3_pressed_{false};
+    std::atomic_bool boot_pressed_{false};
+    std::atomic_bool emergency_restart_timer_running_{false};
+    std::atomic_bool emergency_restart_ready_{false};
+
+    void CancelEmergencyRestart() {
+        emergency_restart_ready_.store(false);
+        if (emergency_restart_timer_running_.exchange(false)) {
+            esp_err_t ret = esp_timer_stop(emergency_restart_timer_);
+            if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "Failed to stop emergency restart timer: %s", esp_err_to_name(ret));
+            }
+        }
+    }
+
+    void OnEmergencyRestartTimer() {
+        emergency_restart_timer_running_.store(false);
+        if (key3_pressed_.load() && boot_pressed_.load()) {
+            emergency_restart_ready_.store(true);
+            ESP_LOGW(TAG, "Emergency restart armed; release GPIO18 and BOOT to restart");
+        }
+    }
+
+    void OnEmergencyButtonPress(bool is_key3) {
+        if (is_key3) {
+            key3_pressed_.store(true);
+        } else {
+            boot_pressed_.store(true);
+        }
+
+        if (!key3_pressed_.load() || !boot_pressed_.load() ||
+            emergency_restart_ready_.load() || emergency_restart_timer_running_.load()) {
+            return;
+        }
+
+        emergency_restart_timer_running_.store(true);
+        esp_err_t ret = esp_timer_start_once(emergency_restart_timer_, 10 * 1000 * 1000);
+        if (ret != ESP_OK) {
+            emergency_restart_timer_running_.store(false);
+            ESP_LOGW(TAG, "Failed to start emergency restart timer: %s", esp_err_to_name(ret));
+        } else {
+            ESP_LOGI(TAG, "Emergency restart started; hold GPIO18 and BOOT for 10 seconds");
+        }
+    }
+
+    void OnEmergencyButtonRelease(bool is_key3) {
+        if (is_key3) {
+            key3_pressed_.store(false);
+        } else {
+            boot_pressed_.store(false);
+        }
+
+        if (!key3_pressed_.load() && !boot_pressed_.load() &&
+            emergency_restart_ready_.exchange(false)) {
+            // GPIO0 is the BOOT strap pin. Wait until both buttons are released
+            // before restarting, otherwise the chip may enter download mode.
+            ESP_LOGW(TAG, "Emergency restart requested");
+            esp_restart();
+            return;
+        }
+
+        // Once the 10-second hold has completed, keep the restart armed while
+        // either button is being released. Cancel only before the timer fires.
+        if (!emergency_restart_ready_.load() &&
+            (!key3_pressed_.load() || !boot_pressed_.load())) {
+            CancelEmergencyRestart();
+        }
+    }
 
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
@@ -205,6 +279,22 @@ private:
     }
 
     void InitializeButtons() {
+        esp_timer_create_args_t emergency_restart_timer_args = {
+            .callback = [](void* arg) {
+                static_cast<WaveshareEsp32s3TouchAMOLED2inch16*>(arg)->OnEmergencyRestartTimer();
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "emergency_restart",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&emergency_restart_timer_args, &emergency_restart_timer_));
+
+        key3_button_.OnPressDown([this]() { OnEmergencyButtonPress(true); });
+        key3_button_.OnPressUp([this]() { OnEmergencyButtonRelease(true); });
+        boot_button_.OnPressDown([this]() { OnEmergencyButtonPress(false); });
+        boot_button_.OnPressUp([this]() { OnEmergencyButtonRelease(false); });
+
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
@@ -311,7 +401,8 @@ private:
     }
 
 public:
-    WaveshareEsp32s3TouchAMOLED2inch16() : boot_button_(BOOT_BUTTON_GPIO) {
+    WaveshareEsp32s3TouchAMOLED2inch16()
+        : key3_button_(KEY3_BUTTON_GPIO), boot_button_(BOOT_BUTTON_GPIO) {
         InitializePowerSaveTimer();
         InitializeCodecI2c();
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_1_75
