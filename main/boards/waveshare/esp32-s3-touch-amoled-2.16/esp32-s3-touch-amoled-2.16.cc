@@ -1,5 +1,6 @@
 #include "wifi_board.h"
 #include "display/lcd_display.h"
+#include "assets/lang_config.h"
 #include "display/lvgl_display/lvgl_theme.h"
 #include "esp_lcd_co5300.h"
 
@@ -29,6 +30,8 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
+#include <string>
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch16"
 
@@ -89,27 +92,22 @@ static const co5300_lcd_init_cmd_t vendor_specific_init[] = {
 class CustomLcdDisplay : public SpiLcdDisplay {
 private:
     static constexpr lv_coord_t kEmotionSourceSize = 108;
-    static constexpr lv_coord_t kEmotionImageSize = 300;  // Let the lower body sit behind the speech bubble
+    static constexpr lv_coord_t kEmotionImageSize = 300;
     static constexpr lv_coord_t kEmotionBottomMargin = 0;
-    static constexpr lv_coord_t kStatusBubbleWidth = 190;
-    static constexpr lv_coord_t kStatusBubbleHeight = 56;
-    static constexpr lv_coord_t kStatusBubbleTop = 180;
-    static constexpr lv_coord_t kChargingBubbleWidth = 178;
-    static constexpr lv_coord_t kChargingBubbleHeight = 50;
-    static constexpr lv_coord_t kChargingBubbleTop = 122;
-    static constexpr lv_coord_t kBottomBubbleWidthMargin = 24;
-    static constexpr lv_coord_t kBottomBubbleHeight = 66;
-    static constexpr lv_coord_t kBottomBubbleBottomMargin = 10;
-    static constexpr lv_coord_t kStaminaPanelWidth = 264;
-    static constexpr lv_coord_t kStaminaPanelHeight = 82;
-    static constexpr lv_coord_t kStaminaIconSize = 52;
-    static constexpr lv_coord_t kStaminaBarWidth = 174;
-    static constexpr lv_coord_t kStaminaBarHeight = 10;
-    static constexpr lv_coord_t kStaminaContentLeft = 76;
-
-    // LVGL keeps the image object's layout size at 64x64 while scaling its
-    // drawing around the center pivot. Move the object up by the overscan so
-    // the scaled drawing, rather than the unscaled object, sits on the bottom.
+    static constexpr lv_coord_t kStatusBubbleWidth = 152;
+    static constexpr lv_coord_t kStatusBubbleHeight = 32;
+    static constexpr lv_coord_t kStatusBubbleTop = 36;
+    static constexpr lv_coord_t kSpeechWidth = 212;
+    static constexpr lv_coord_t kSpeechHeight = 82;
+    static constexpr lv_coord_t kSpeechTop = 88;
+    static constexpr lv_coord_t kSpeechTextWidth = kSpeechWidth - 34;
+    static constexpr lv_coord_t kSpeechLineSpace = 4;
+    static constexpr uint32_t kSpeechPageDurationMs = 4000;
+    static constexpr lv_coord_t kStaminaPanelWidth = 164;
+    static constexpr lv_coord_t kStaminaPanelHeight = 44;
+    static constexpr lv_coord_t kStaminaBarWidth = 67;
+    static constexpr lv_coord_t kStaminaBarHeight = 4;
+    static constexpr lv_coord_t kStaminaContentLeft = 42;
     static constexpr lv_coord_t kEmotionScaleOverscan =
         (kEmotionImageSize - kEmotionSourceSize) / 2;
     static constexpr uint16_t kEmotionImageScale =
@@ -120,13 +118,64 @@ private:
     lv_obj_t* stamina_label_ = nullptr;
     lv_obj_t* stamina_bar_background_ = nullptr;
     lv_obj_t* stamina_bar_fill_ = nullptr;
-    lv_obj_t* charging_panel_ = nullptr;
     lv_obj_t* charging_label_ = nullptr;
-    lv_obj_t* charging_text_label_ = nullptr;
+    lv_timer_t* speech_timer_ = nullptr;
+    std::string speech_text_;
+    size_t speech_offset_ = 0;
+
+    // Runs under the LVGL lock (including when invoked by its timer). Measure
+    // each UTF-8 prefix using the same font/wrapping rules as the label.
+    void ShowSpeechPage() {
+        if (chat_message_label_ == nullptr || speech_text_.empty()) {
+            return;
+        }
+        if (speech_offset_ >= speech_text_.size()) {
+            speech_offset_ = 0;
+        }
+        const auto* font = lv_obj_get_style_text_font(chat_message_label_, LV_PART_MAIN);
+        const auto letter_space =
+            lv_obj_get_style_text_letter_space(chat_message_label_, LV_PART_MAIN);
+        const int32_t height = 2 * font->line_height + kSpeechLineSpace;
+        char page[256] = {};
+        size_t length = 0;
+        while (speech_offset_ + length < speech_text_.size()) {
+            size_t next = length + 1;
+            while (next - length < 4 && speech_offset_ + next < speech_text_.size() &&
+                   (static_cast<unsigned char>(speech_text_[speech_offset_ + next]) & 0xC0) ==
+                       0x80) {
+                ++next;
+            }
+            if (next >= sizeof(page)) {
+                break;
+            }
+            std::memcpy(page + length, speech_text_.data() + speech_offset_ + length,
+                        next - length);
+            page[next] = '\0';
+            lv_point_t size;
+            lv_text_get_size(&size, page, font, letter_space, kSpeechLineSpace, kSpeechTextWidth,
+                             LV_TEXT_FLAG_NONE);
+            if (size.y > height && length > 0) {
+                page[length] = '\0';
+                break;
+            }
+            length = next;
+        }
+        lv_label_set_text(chat_message_label_, page);
+        speech_offset_ += length;
+        if (speech_timer_ != nullptr) {
+            if (hide_subtitle_ || speech_offset_ >= speech_text_.size()) {
+                // Keep the final page visible until replaced or cleared.
+                lv_timer_pause(speech_timer_);
+            } else {
+                lv_timer_reset(speech_timer_);
+                lv_timer_resume(speech_timer_);
+            }
+        }
+    }
 
     static lv_color_t StaminaColor(int level) {
         if (level >= 60) {
-            return lv_color_hex(0x45C56B);
+            return lv_color_hex(0x9C76C6);
         }
         if (level >= 30) {
             return lv_color_hex(0xF0B83F);
@@ -135,10 +184,8 @@ private:
     }
 
     void UpdateStamina(int level, bool charging) {
-        if (stamina_panel_ == nullptr || stamina_icon_ == nullptr ||
-            stamina_label_ == nullptr ||
-            stamina_bar_fill_ == nullptr || charging_panel_ == nullptr ||
-            charging_label_ == nullptr || charging_text_label_ == nullptr) {
+        if (stamina_panel_ == nullptr || stamina_icon_ == nullptr || stamina_label_ == nullptr ||
+            stamina_bar_fill_ == nullptr || charging_label_ == nullptr) {
             return;
         }
 
@@ -150,16 +197,17 @@ private:
 
         lv_color_t color = StaminaColor(level);
         char stamina_text[24];
-        std::snprintf(stamina_text, sizeof(stamina_text), "体力 %d/100", level);
+        std::snprintf(stamina_text, sizeof(stamina_text), "%d", level);
         lv_label_set_text(stamina_label_, stamina_text);
         lv_obj_set_style_bg_color(stamina_bar_fill_, color, 0);
         lv_obj_set_width(stamina_bar_fill_, (kStaminaBarWidth * level) / 100);
+        lv_obj_set_flag(stamina_bar_fill_, LV_OBJ_FLAG_HIDDEN, level == 0);
 
         if (charging) {
             lv_label_set_text(charging_label_, MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_BOLT);
-            lv_obj_remove_flag(charging_panel_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(charging_label_, LV_OBJ_FLAG_HIDDEN);
         } else {
-            lv_obj_add_flag(charging_panel_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(charging_label_, LV_OBJ_FLAG_HIDDEN);
         }
     }
 
@@ -170,7 +218,7 @@ private:
 
         auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
         lv_color_t bubble_color = lv_color_hex(0xFFF8FF);
-        lv_color_t bubble_border = lv_color_hex(0xA86BD8);
+        lv_color_t bubble_border = lv_color_hex(0xC9ACD9);
         lv_color_t text_color = lv_color_hex(0x2B2140);
 
         if (top_bar_ != nullptr) {
@@ -185,12 +233,12 @@ private:
             lv_obj_set_size(status_bar_, kStatusBubbleWidth, kStatusBubbleHeight);
             lv_obj_set_style_bg_color(status_bar_, bubble_color, 0);
             lv_obj_set_style_bg_opa(status_bar_, LV_OPA_90, 0);
-            lv_obj_set_style_radius(status_bar_, 24, 0);
-            lv_obj_set_style_border_width(status_bar_, 2, 0);
+            lv_obj_set_style_radius(status_bar_, 16, 0);
+            lv_obj_set_style_border_width(status_bar_, 1, 0);
             lv_obj_set_style_border_color(status_bar_, bubble_border, 0);
             lv_obj_set_style_pad_all(status_bar_, 0, 0);
             lv_obj_set_style_layout(status_bar_, LV_LAYOUT_NONE, 0);
-            lv_obj_align(status_bar_, LV_ALIGN_TOP_RIGHT, -16, kStatusBubbleTop);
+            lv_obj_align(status_bar_, LV_ALIGN_TOP_RIGHT, -28, kStatusBubbleTop);
         }
         if (status_label_ != nullptr) {
             lv_obj_set_width(status_label_, kStatusBubbleWidth - 24);
@@ -200,119 +248,93 @@ private:
         }
         if (notification_label_ != nullptr) {
             lv_obj_set_width(notification_label_, kStatusBubbleWidth - 24);
+            lv_label_set_long_mode(notification_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
             lv_obj_set_style_text_color(notification_label_, text_color, 0);
             lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_align(notification_label_, LV_ALIGN_CENTER, 0, 0);
         }
 
         if (bottom_bar_ != nullptr) {
-            lv_obj_set_size(bottom_bar_, LV_HOR_RES - kBottomBubbleWidthMargin,
-                            kBottomBubbleHeight);
+            lv_obj_set_size(bottom_bar_, kSpeechWidth, kSpeechHeight);
             lv_obj_set_style_bg_color(bottom_bar_, bubble_color, 0);
             lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_90, 0);
-            lv_obj_set_style_radius(bottom_bar_, 20, 0);
-            lv_obj_set_style_border_width(bottom_bar_, 2, 0);
+            lv_obj_set_style_radius(bottom_bar_, 18, 0);
+            lv_obj_set_style_border_width(bottom_bar_, 1, 0);
             lv_obj_set_style_border_color(bottom_bar_, bubble_border, 0);
-            lv_obj_set_style_pad_left(bottom_bar_, 16, 0);
-            lv_obj_set_style_pad_right(bottom_bar_, 16, 0);
-            lv_obj_set_style_pad_top(bottom_bar_, 8, 0);
-            lv_obj_set_style_pad_bottom(bottom_bar_, 8, 0);
-            lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, -kBottomBubbleBottomMargin);
+            lv_obj_set_style_pad_all(bottom_bar_, 16, 0);
+            lv_obj_set_style_pad_top(bottom_bar_, 10, 0);
+            lv_obj_set_style_pad_bottom(bottom_bar_, 10, 0);
+            lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_align(bottom_bar_, LV_ALIGN_TOP_RIGHT, -28, kSpeechTop);
         }
         if (chat_message_label_ != nullptr) {
-            lv_obj_set_width(chat_message_label_, LV_HOR_RES - 56);
+            lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(chat_message_label_, kSpeechTextWidth);
+            lv_obj_set_height(chat_message_label_, LV_SIZE_CONTENT);
+            lv_obj_set_style_text_line_space(chat_message_label_, kSpeechLineSpace, 0);
             lv_obj_set_style_text_color(chat_message_label_, text_color, 0);
-            lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
-            lv_obj_align(chat_message_label_, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_LEFT, 0);
+            lv_obj_align(chat_message_label_, LV_ALIGN_TOP_LEFT, 0, 0);
         }
 
         if (stamina_panel_ != nullptr) {
             lv_obj_set_style_bg_color(stamina_panel_, bubble_color, 0);
             lv_obj_set_style_bg_opa(stamina_panel_, LV_OPA_90, 0);
-            lv_obj_set_style_radius(stamina_panel_, 28, 0);
-            lv_obj_set_style_border_width(stamina_panel_, 2, 0);
+            lv_obj_set_style_radius(stamina_panel_, 16, 0);
+            lv_obj_set_style_border_width(stamina_panel_, 1, 0);
             lv_obj_set_style_border_color(stamina_panel_, bubble_border, 0);
         }
         if (stamina_icon_ != nullptr) {
             lv_obj_set_style_text_color(stamina_icon_, lv_color_hex(0x8F3FF0), 0);
-            lv_obj_set_style_text_font(stamina_icon_, lvgl_theme->large_icon_font()->font(), 0);
+            lv_obj_set_style_text_font(stamina_icon_, lvgl_theme->icon_font()->font(), 0);
         }
         if (stamina_label_ != nullptr) {
             lv_obj_set_style_text_color(stamina_label_, text_color, 0);
             lv_obj_set_style_text_font(stamina_label_, lvgl_theme->text_font()->font(), 0);
         }
-        if (charging_panel_ != nullptr) {
-            lv_obj_set_style_bg_color(charging_panel_, bubble_color, 0);
-            lv_obj_set_style_bg_opa(charging_panel_, LV_OPA_90, 0);
-            lv_obj_set_style_radius(charging_panel_, 22, 0);
-            lv_obj_set_style_border_width(charging_panel_, 2, 0);
-            lv_obj_set_style_border_color(charging_panel_, bubble_border, 0);
-        }
         if (charging_label_ != nullptr) {
-            lv_obj_set_style_text_color(charging_label_, lv_color_hex(0x8F3FF0), 0);
-            lv_obj_set_style_text_font(charging_label_, lvgl_theme->large_icon_font()->font(), 0);
-        }
-        if (charging_text_label_ != nullptr) {
-            lv_obj_set_style_text_color(charging_text_label_, lv_color_hex(0x8F3FF0), 0);
-            lv_obj_set_style_text_font(charging_text_label_, lvgl_theme->text_font()->font(), 0);
+            lv_obj_set_style_text_color(charging_label_, lv_color_hex(0x8960AA), 0);
+            lv_obj_set_style_text_font(charging_label_, lvgl_theme->icon_font()->font(), 0);
         }
     }
 
     void CreateStaminaHud() {
-        auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
         stamina_panel_ = lv_obj_create(lv_screen_active());
         lv_obj_set_size(stamina_panel_, kStaminaPanelWidth, kStaminaPanelHeight);
-        lv_obj_set_style_radius(stamina_panel_, 22, 0);
         lv_obj_set_style_pad_all(stamina_panel_, 0, 0);
-        lv_obj_set_style_border_width(stamina_panel_, 2, 0);
-        lv_obj_set_scrollbar_mode(stamina_panel_, LV_SCROLLBAR_MODE_OFF);
-        lv_obj_align(stamina_panel_, LV_ALIGN_TOP_RIGHT, -12, 34);
+        lv_obj_remove_flag(stamina_panel_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align(stamina_panel_, LV_ALIGN_TOP_LEFT, 28, 30);
 
         stamina_icon_ = lv_label_create(stamina_panel_);
         lv_label_set_text(stamina_icon_, MATERIAL_SYMBOLS_FAVORITE);
-        lv_obj_set_size(stamina_icon_, kStaminaIconSize, kStaminaIconSize);
-        lv_obj_set_style_text_font(stamina_icon_, lvgl_theme->large_icon_font()->font(), 0);
-        lv_obj_set_style_text_color(stamina_icon_, lv_color_hex(0x8F3FF0), 0);
-        lv_obj_set_style_text_align(stamina_icon_, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_align(stamina_icon_, LV_ALIGN_LEFT_MID, 10, 0);
+        lv_obj_align(stamina_icon_, LV_ALIGN_LEFT_MID, 11, 0);
 
         stamina_label_ = lv_label_create(stamina_panel_);
-        lv_obj_set_width(stamina_label_, kStaminaPanelWidth - kStaminaContentLeft - 8);
-        lv_obj_set_style_text_font(stamina_label_, lvgl_theme->text_font()->font(), 0);
-        lv_obj_align(stamina_label_, LV_ALIGN_TOP_LEFT, kStaminaContentLeft, 38);
+        lv_obj_set_width(stamina_label_, kStaminaBarWidth);
+        lv_obj_align(stamina_label_, LV_ALIGN_TOP_LEFT, kStaminaContentLeft, 3);
 
-        charging_panel_ = lv_obj_create(lv_screen_active());
-        lv_obj_set_size(charging_panel_, kChargingBubbleWidth, kChargingBubbleHeight);
-        lv_obj_set_style_radius(charging_panel_, 22, 0);
-        lv_obj_set_style_pad_all(charging_panel_, 0, 0);
-        lv_obj_set_style_border_width(charging_panel_, 2, 0);
-        lv_obj_set_scrollbar_mode(charging_panel_, LV_SCROLLBAR_MODE_OFF);
-        lv_obj_align(charging_panel_, LV_ALIGN_TOP_RIGHT, -18, kChargingBubbleTop);
-
-        charging_label_ = lv_label_create(charging_panel_);
-        lv_obj_set_style_text_font(charging_label_, lvgl_theme->large_icon_font()->font(), 0);
-        lv_obj_set_style_text_color(charging_label_, lv_color_hex(0x8F3FF0), 0);
-        lv_obj_align(charging_label_, LV_ALIGN_LEFT_MID, 10, 0);
-
-        charging_text_label_ = lv_label_create(charging_panel_);
-        lv_obj_set_style_text_font(charging_text_label_, lvgl_theme->text_font()->font(), 0);
-        lv_obj_set_style_text_color(charging_text_label_, lv_color_hex(0x8F3FF0), 0);
-        lv_label_set_text(charging_text_label_, "充电中 +1");
-        lv_obj_align(charging_text_label_, LV_ALIGN_LEFT_MID, 48, 0);
-        lv_obj_add_flag(charging_panel_, LV_OBJ_FLAG_HIDDEN);
+        charging_label_ = lv_label_create(stamina_panel_);
+        lv_label_set_text(charging_label_, MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_BOLT);
+        lv_obj_align(charging_label_, LV_ALIGN_RIGHT_MID, -12, 0);
+        lv_obj_add_flag(charging_label_, LV_OBJ_FLAG_HIDDEN);
 
         stamina_bar_background_ = lv_obj_create(stamina_panel_);
         lv_obj_set_size(stamina_bar_background_, kStaminaBarWidth, kStaminaBarHeight);
-        lv_obj_set_style_bg_color(stamina_bar_background_, lv_color_hex(0xE1D5E8), 0);
+        lv_obj_set_style_bg_color(stamina_bar_background_, lv_color_hex(0xE7DEED), 0);
         lv_obj_set_style_bg_opa(stamina_bar_background_, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(stamina_bar_background_, kStaminaBarHeight / 2, 0);
         lv_obj_set_style_border_width(stamina_bar_background_, 0, 0);
-        lv_obj_align(stamina_bar_background_, LV_ALIGN_TOP_LEFT, kStaminaContentLeft, 14);
+        lv_obj_set_style_pad_all(stamina_bar_background_, 0, 0);
+        lv_obj_remove_flag(stamina_bar_background_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align(stamina_bar_background_, LV_ALIGN_TOP_LEFT, kStaminaContentLeft, 32);
 
         stamina_bar_fill_ = lv_obj_create(stamina_bar_background_);
         lv_obj_set_size(stamina_bar_fill_, 1, kStaminaBarHeight);
         lv_obj_set_style_radius(stamina_bar_fill_, kStaminaBarHeight / 2, 0);
         lv_obj_set_style_border_width(stamina_bar_fill_, 0, 0);
+        lv_obj_set_style_bg_opa(stamina_bar_fill_, LV_OPA_COVER, 0);
+        lv_obj_set_style_pad_all(stamina_bar_fill_, 0, 0);
+        lv_obj_remove_flag(stamina_bar_fill_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_align(stamina_bar_fill_, LV_ALIGN_LEFT_MID, 0, 0);
 
         ApplyPetUiStyles();
@@ -320,8 +342,59 @@ private:
     }
 
 public:
+    ~CustomLcdDisplay() override {
+        DisplayLockGuard lock(this);
+        if (speech_timer_ != nullptr) {
+            lv_timer_delete(speech_timer_);
+        }
+    }
+
+    void SetChatMessage(const char* role, const char* content) override {
+        DisplayLockGuard lock(this);
+        if (chat_message_label_ == nullptr || bottom_bar_ == nullptr) {
+            return;
+        }
+        (void)role;
+        if (speech_timer_ != nullptr) {
+            lv_timer_pause(speech_timer_);
+        }
+        speech_text_ = content != nullptr ? content : "";
+        speech_offset_ = 0;
+        if (speech_text_.empty()) {
+            lv_label_set_text(chat_message_label_, "");
+            lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+            return;
+        }
+        ShowSpeechPage();
+        if (!hide_subtitle_) {
+            lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    void ClearChatMessages() override { SetChatMessage("system", ""); }
+
+    void SetStatus(const char* status) override {
+        SpiLcdDisplay::SetStatus(status);
+        if (status != nullptr && std::strcmp(status, Lang::Strings::LISTENING) == 0) {
+            ClearChatMessages();
+        }
+    }
+
+    void SetHideSubtitle(bool hide) override {
+        SpiLcdDisplay::SetHideSubtitle(hide);
+        DisplayLockGuard lock(this);
+        if (speech_timer_ != nullptr) {
+            if (hide) {
+                lv_timer_pause(speech_timer_);
+            } else if (!speech_text_.empty()) {
+                speech_offset_ = 0;
+                ShowSpeechPage();
+            }
+        }
+    }
+
     static void rounder_event_cb(lv_event_t* e) {
-        lv_area_t* area = (lv_area_t* )lv_event_get_param(e);
+        lv_area_t* area = (lv_area_t*)lv_event_get_param(e);
         uint16_t x1 = area->x1;
         uint16_t x2 = area->x2;
 
@@ -336,17 +409,11 @@ public:
         area->y2 = ((y2 >> 1) << 1) + 1;
     }
 
-    CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle,
-                     esp_lcd_panel_handle_t panel_handle,
-                     int width,
-                     int height,
-                     int offset_x,
-                     int offset_y,
-                     bool mirror_x,
-                     bool mirror_y,
-                     bool swap_xy)
-        : SpiLcdDisplay(io_handle, panel_handle,
-                        width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy) {
+    CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle, esp_lcd_panel_handle_t panel_handle,
+                     int width, int height, int offset_x, int offset_y, bool mirror_x,
+                     bool mirror_y, bool swap_xy)
+        : SpiLcdDisplay(io_handle, panel_handle, width, height, offset_x, offset_y, mirror_x,
+                        mirror_y, swap_xy) {
         // Note: UI customization should be done in SetupUI(), not in constructor
         // to ensure lvgl objects are created before accessing them
     }
@@ -364,6 +431,15 @@ public:
         lv_obj_align(emoji_image_, LV_ALIGN_BOTTOM_MID, 0,
                      -(kEmotionBottomMargin + kEmotionScaleOverscan));
         CreateStaminaHud();
+        speech_timer_ = lv_timer_create(
+            [](lv_timer_t* timer) {
+                auto* display = static_cast<CustomLcdDisplay*>(lv_timer_get_user_data(timer));
+                if (!display->hide_subtitle_) {
+                    display->ShowSpeechPage();
+                }
+            },
+            kSpeechPageDurationMs, this);
+        lv_timer_pause(speech_timer_);
         ApplyPetUiStyles();
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
     }
@@ -375,6 +451,10 @@ public:
         }
         DisplayLockGuard lock(this);
         ApplyPetUiStyles();
+        if (!speech_text_.empty()) {
+            speech_offset_ = 0;
+            ShowSpeechPage();
+        }
     }
 
     virtual void UpdateStatusBar(bool update_all = false) override {

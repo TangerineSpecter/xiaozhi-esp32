@@ -364,8 +364,8 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_C6_TOUCH_AMOLED_2_16)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_2_16)
     set(BOARD_DIR "waveshare/esp32-s3-touch-amoled-2.16")
-    set(BUILTIN_TEXT_FONT font_noto_sans_basic_30_4)
-    set(BUILTIN_ICON_FONT font_material_symbols_30_4)
+    set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
+    set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_EMOJI_COLLECTION
         "${PROJECT_DIR}/main/boards/waveshare/esp32-s3-touch-amoled-2.16/assets/emoji")
     set(DEFAULT_ASSETS_EXTRA_FILES
