@@ -1,27 +1,30 @@
-#include "wifi_board.h"
-#include "display/lcd_display.h"
 #include "assets/lang_config.h"
+#include "display/lcd_display.h"
 #include "display/lvgl_display/lvgl_theme.h"
 #include "esp_lcd_co5300.h"
+#include "wifi_board.h"
 
-#include "codecs/box_audio_codec.h"
 #include "application.h"
+#include "axp2101.h"
 #include "button.h"
+#include "codecs/box_audio_codec.h"
+#include "config.h"
+#include "i2c_device.h"
 #include "led/single_led.h"
 #include "mcp_server.h"
-#include "config.h"
 #include "power_save_timer.h"
-#include "axp2101.h"
-#include "i2c_device.h"
 
+#include <driver/i2c_master.h>
+#include <driver/spi_master.h>
+#include <esp_lcd_panel_vendor.h>
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_timer.h>
-#include <esp_lcd_panel_vendor.h>
-#include <driver/i2c_master.h>
-#include <driver/spi_master.h>
 #include "esp_io_expander_tca9554.h"
 #include "settings.h"
+#include "settings_menu.h"
+
+#include <algorithm>
 
 #include <esp_lcd_touch_cst9217.h>
 #include <esp_lvgl_port.h>
@@ -37,9 +40,37 @@
 
 class Pmic : public Axp2101 {
 public:
+    // AXP2101 IRQ status 0x49: short press bit 3, long press bit 2.
+    static constexpr uint8_t kShortPress = 1 << 3;
+    static constexpr uint8_t kLongPress = 1 << 2;
+
+    void InitializeMenuKey() {
+        // IRQLEVEL bits [5:4] = 2 means 2 seconds. Preserve power on/off timings.
+        WriteReg(0x27, (ReadReg(0x27) & 0xCF) | 0x20);
+        WriteReg(0x49, kShortPress | kLongPress);
+        WriteReg(0x41, ReadReg(0x41) | kShortPress | kLongPress);
+    }
+
+    uint8_t ReadMenuKey() {
+        // Poll on a dedicated task: I2C must not block the audio/main/timer tasks.
+        uint8_t reg = 0x49;
+        uint8_t status = 0;
+        if (i2c_master_transmit_receive(i2c_device_, &reg, 1, &status, 1, 20) != ESP_OK) {
+            return 0;
+        }
+        status &= kShortPress | kLongPress;
+        if (status != 0) {
+            uint8_t clear[] = {reg, status};
+            if (i2c_master_transmit(i2c_device_, clear, sizeof(clear), 20) != ESP_OK) {
+                return 0;
+            }
+        }
+        return status;
+    }
+
     Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Axp2101(i2c_bus, addr) {
-        WriteReg(0x22, 0b110); // PWRON > OFFLEVEL as POWEROFF Source enable
-        WriteReg(0x27, 0x10);  // hold 4s to power off
+        WriteReg(0x22, 0b110);  // PWRON > OFFLEVEL as POWEROFF Source enable
+        WriteReg(0x27, 0x10);   // hold 4s to power off
 
         // Disable All DCs but DC1
         WriteReg(0x80, 0x01);
@@ -56,11 +87,12 @@ public:
         // Enable ALDO1(MIC)
         WriteReg(0x90, 0x01);
 
-        WriteReg(0x64, 0x02); // CV charger voltage setting to 4.1V
+        WriteReg(0x64, 0x02);  // CV charger voltage setting to 4.1V
 
-        WriteReg(0x61, 0x02); // set Main battery precharge current to 50mA
-        WriteReg(0x62, 0x0A); // set Main battery charger current to 400mA ( 0x08-200mA, 0x09-300mA, 0x0A-400mA )
-        WriteReg(0x63, 0x01); // set Main battery term charge current to 25mA
+        WriteReg(0x61, 0x02);  // set Main battery precharge current to 50mA
+        WriteReg(0x62, 0x0A);  // set Main battery charger current to 400mA ( 0x08-200mA,
+                               // 0x09-300mA, 0x0A-400mA )
+        WriteReg(0x63, 0x01);  // set Main battery term charge current to 25mA
     }
 };
 
@@ -69,7 +101,7 @@ public:
 #define LCD_OPCODE_WRITE_COLOR (0x32ULL)
 
 static const co5300_lcd_init_cmd_t vendor_specific_init[] = {
-    {0x11, (uint8_t[]){0x00}, 0, 600}, // Sleep out
+    {0x11, (uint8_t[]){0x00}, 0, 600},  // Sleep out
 
     {0xFE, (uint8_t[]){0x20}, 1, 0},
     {0x19, (uint8_t[]){0x10}, 1, 0},
@@ -100,6 +132,7 @@ private:
     static constexpr lv_coord_t kSpeechWidth = 212;
     static constexpr lv_coord_t kSpeechHeight = 82;
     static constexpr lv_coord_t kSpeechTop = 88;
+    static constexpr lv_coord_t kSpeechTailHeight = 10;
     static constexpr lv_coord_t kSpeechTextWidth = kSpeechWidth - 34;
     static constexpr lv_coord_t kSpeechLineSpace = 4;
     static constexpr uint32_t kSpeechPageDurationMs = 4000;
@@ -113,6 +146,8 @@ private:
     static constexpr uint16_t kEmotionImageScale =
         static_cast<uint16_t>((kEmotionImageSize * 256) / kEmotionSourceSize);
 
+    SettingsMenu menu_;
+
     lv_obj_t* stamina_panel_ = nullptr;
     lv_obj_t* stamina_icon_ = nullptr;
     lv_obj_t* stamina_label_ = nullptr;
@@ -122,6 +157,60 @@ private:
     lv_timer_t* speech_timer_ = nullptr;
     std::string speech_text_;
     size_t speech_offset_ = 0;
+
+    // Draw on the status label itself so notifications hide the dot too.
+    static void DrawSpeakingDot(lv_event_t* event) {
+        auto* label = lv_event_get_target_obj(event);
+        if (std::strcmp(lv_label_get_text(label), Lang::Strings::SPEAKING) != 0) {
+            return;
+        }
+        lv_area_t area;
+        lv_obj_get_coords(label, &area);
+        const int32_t center_y = (area.y1 + area.y2) / 2;
+        lv_area_t dot_area = {area.x1 + 4, center_y - 3, area.x1 + 10, center_y + 3};
+        lv_draw_rect_dsc_t dot;
+        lv_draw_rect_dsc_init(&dot);
+        dot.radius = LV_RADIUS_CIRCLE;
+        dot.bg_color = lv_color_hex(0x45C56B);
+        dot.bg_opa = LV_OPA_COVER;
+        lv_draw_rect(lv_event_get_layer(event), &dot, &dot_area);
+    }
+
+    // Draw as part of the bubble so clearing/hiding it also removes the tail.
+    static void DrawSpeechTail(lv_event_t* event) {
+        if (lv_event_get_code(event) == LV_EVENT_REFR_EXT_DRAW_SIZE) {
+            lv_event_set_ext_draw_size(event, kSpeechTailHeight + 2);
+            return;
+        }
+        if (lv_event_get_code(event) != LV_EVENT_DRAW_MAIN_END) {
+            return;
+        }
+        auto* bubble = lv_event_get_target_obj(event);
+        auto* layer = lv_event_get_layer(event);
+        lv_area_t area;
+        lv_obj_get_coords(bubble, &area);
+
+        lv_draw_triangle_dsc_t tail;
+        lv_draw_triangle_dsc_init(&tail);
+        tail.color = lv_obj_get_style_bg_color(bubble, LV_PART_MAIN);
+        tail.opa = LV_OPA_COVER;
+        // Overlap the bottom border by one pixel to leave an open, seamless base.
+        tail.p[0] = {area.x1 + 24, area.y2 - 1};
+        tail.p[1] = {area.x1 + 44, area.y2 - 1};
+        tail.p[2] = {area.x1 + 20, area.y2 + kSpeechTailHeight};
+        lv_draw_triangle(layer, &tail);
+
+        lv_draw_line_dsc_t edge;
+        lv_draw_line_dsc_init(&edge);
+        edge.color = lv_obj_get_style_border_color(bubble, LV_PART_MAIN);
+        edge.width = 1;
+        edge.p1 = tail.p[0];
+        edge.p2 = tail.p[2];
+        lv_draw_line(layer, &edge);
+        edge.p1 = tail.p[2];
+        edge.p2 = tail.p[1];
+        lv_draw_line(layer, &edge);
+    }
 
     // Runs under the LVGL lock (including when invoked by its timer). Measure
     // each UTF-8 prefix using the same font/wrapping rules as the label.
@@ -175,7 +264,7 @@ private:
 
     static lv_color_t StaminaColor(int level) {
         if (level >= 60) {
-            return lv_color_hex(0x9C76C6);
+            return lv_color_hex(0x45C56B);
         }
         if (level >= 30) {
             return lv_color_hex(0xF0B83F);
@@ -242,6 +331,9 @@ private:
         }
         if (status_label_ != nullptr) {
             lv_obj_set_width(status_label_, kStatusBubbleWidth - 24);
+            const bool speaking =
+                std::strcmp(lv_label_get_text(status_label_), Lang::Strings::SPEAKING) == 0;
+            lv_obj_set_style_pad_left(status_label_, speaking ? 16 : 0, 0);
             lv_obj_set_style_text_color(status_label_, text_color, 0);
             lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
@@ -257,7 +349,7 @@ private:
         if (bottom_bar_ != nullptr) {
             lv_obj_set_size(bottom_bar_, kSpeechWidth, kSpeechHeight);
             lv_obj_set_style_bg_color(bottom_bar_, bubble_color, 0);
-            lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_90, 0);
+            lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_COVER, 0);
             lv_obj_set_style_radius(bottom_bar_, 18, 0);
             lv_obj_set_style_border_width(bottom_bar_, 1, 0);
             lv_obj_set_style_border_color(bottom_bar_, bubble_border, 0);
@@ -293,7 +385,7 @@ private:
             lv_obj_set_style_text_font(stamina_label_, lvgl_theme->text_font()->font(), 0);
         }
         if (charging_label_ != nullptr) {
-            lv_obj_set_style_text_color(charging_label_, lv_color_hex(0x8960AA), 0);
+            lv_obj_set_style_text_color(charging_label_, lv_color_hex(0x45C56B), 0);
             lv_obj_set_style_text_font(charging_label_, lvgl_theme->icon_font()->font(), 0);
         }
     }
@@ -342,8 +434,24 @@ private:
     }
 
 public:
+    void ShowMenu(bool editing, int selected, int volume, bool animate = false) {
+        DisplayLockGuard lock(this);
+        if (current_theme_ == nullptr) {
+            return;
+        }
+        auto* theme = static_cast<LvglTheme*>(current_theme_);
+        menu_.Create(display_, theme->text_font()->font(), theme->icon_font()->font());
+        menu_.Show(editing, selected, volume, animate);
+    }
+
+    void HideMenu() {
+        DisplayLockGuard lock(this);
+        menu_.Hide();
+    }
+
     ~CustomLcdDisplay() override {
         DisplayLockGuard lock(this);
+        menu_.Destroy();
         if (speech_timer_ != nullptr) {
             lv_timer_delete(speech_timer_);
         }
@@ -375,6 +483,14 @@ public:
 
     void SetStatus(const char* status) override {
         SpiLcdDisplay::SetStatus(status);
+        {
+            DisplayLockGuard lock(this);
+            if (status_label_ != nullptr) {
+                const bool speaking =
+                    status != nullptr && std::strcmp(status, Lang::Strings::SPEAKING) == 0;
+                lv_obj_set_style_pad_left(status_label_, speaking ? 16 : 0, 0);
+            }
+        }
         if (status != nullptr && std::strcmp(status, Lang::Strings::LISTENING) == 0) {
             ClearChatMessages();
         }
@@ -430,6 +546,14 @@ public:
         lv_image_set_antialias(emoji_image_, false);
         lv_obj_align(emoji_image_, LV_ALIGN_BOTTOM_MID, 0,
                      -(kEmotionBottomMargin + kEmotionScaleOverscan));
+        if (bottom_bar_ != nullptr) {
+            lv_obj_add_event_cb(bottom_bar_, DrawSpeechTail, LV_EVENT_DRAW_MAIN_END, nullptr);
+            lv_obj_add_event_cb(bottom_bar_, DrawSpeechTail, LV_EVENT_REFR_EXT_DRAW_SIZE, nullptr);
+            lv_obj_refresh_ext_draw_size(bottom_bar_);
+        }
+        if (status_label_ != nullptr) {
+            lv_obj_add_event_cb(status_label_, DrawSpeakingDot, LV_EVENT_DRAW_MAIN_END, nullptr);
+        }
         CreateStaminaHud();
         speech_timer_ = lv_timer_create(
             [](lv_timer_t* timer) {
@@ -490,6 +614,21 @@ public:
     }
 };
 
+// Keep an explicitly saved mute across restarts on this board. The common
+// codec currently replaces zero with 10 during Start().
+class MenuAudioCodec : public BoxAudioCodec {
+public:
+    using BoxAudioCodec::BoxAudioCodec;
+
+    void Start() override {
+        BoxAudioCodec::Start();
+        Settings settings("audio", false);
+        if (settings.GetInt("output_volume", -1) == 0) {
+            output_volume_ = 0;
+        }
+    }
+};
+
 class CustomBacklight : public Backlight {
 public:
     CustomBacklight(esp_lcd_panel_io_handle_t panel_io) : Backlight(), panel_io_(panel_io) {}
@@ -500,7 +639,7 @@ protected:
     virtual void SetBrightnessImpl(uint8_t brightness) override {
         auto display = Board::GetInstance().GetDisplay();
         DisplayLockGuard lock(display);
-        uint8_t data[1] = {((uint8_t)((255*  brightness) / 100))};
+        uint8_t data[1] = {((uint8_t)((255 * brightness) / 100))};
         int lcd_cmd = 0x51;
         lcd_cmd &= 0xff;
         lcd_cmd <<= 8;
@@ -524,6 +663,85 @@ private:
     std::atomic_bool boot_pressed_{false};
     std::atomic_bool emergency_restart_timer_running_{false};
     std::atomic_bool emergency_restart_ready_{false};
+
+    enum class MenuPage { Closed, Settings, Volume };
+    MenuPage menu_page_ = MenuPage::Closed;  // Application task only.
+    int menu_selection_ = 0;
+    int menu_volume_ = 0;
+    std::atomic_bool menu_key_pending_{false};
+
+    void RefreshMenu(bool animate = false) {
+        display_->ShowMenu(menu_page_ == MenuPage::Volume, menu_selection_, menu_volume_, animate);
+    }
+
+    void HandleMenuKey(bool back) {
+        power_save_timer_->WakeUp();
+        if (back) {
+            if (menu_page_ == MenuPage::Volume) {
+                menu_page_ = MenuPage::Settings;
+                RefreshMenu();
+            } else if (menu_page_ == MenuPage::Settings) {
+                menu_page_ = MenuPage::Closed;
+                display_->HideMenu();
+            }
+            return;
+        }
+        if (menu_page_ == MenuPage::Closed) {
+            menu_page_ = MenuPage::Settings;
+            menu_selection_ = 0;
+            RefreshMenu(true);
+        } else if (menu_page_ == MenuPage::Volume) {
+            GetAudioCodec()->SetOutputVolume(menu_volume_);
+            menu_page_ = MenuPage::Settings;
+            RefreshMenu();
+        } else if (menu_selection_ == 0) {
+            menu_volume_ = std::clamp(GetAudioCodec()->output_volume(), 0, 100);
+            menu_page_ = MenuPage::Volume;
+            RefreshMenu();
+        } else {
+            menu_page_ = MenuPage::Closed;
+            display_->HideMenu();
+        }
+    }
+
+    bool HandleMenuDirection(int direction) {
+        power_save_timer_->WakeUp();
+        if (menu_page_ == MenuPage::Closed) {
+            return false;
+        }
+        if (menu_page_ == MenuPage::Volume) {
+            menu_volume_ = std::clamp(menu_volume_ + direction * 5, 0, 100);
+        } else {
+            menu_selection_ = 1 - menu_selection_;
+        }
+        RefreshMenu();
+        return true;
+    }
+
+    void InitializeMenuKey() {
+        pmic_->InitializeMenuKey();
+        BaseType_t result = xTaskCreate(
+            [](void* argument) {
+                auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch16*>(argument);
+                for (;;) {
+                    // Leave latched events in the PMIC while the application is busy.
+                    // At most one polling callback may be queued at a time.
+                    if (!board->menu_key_pending_.load()) {
+                        uint8_t status = board->pmic_->ReadMenuKey();
+                        if (status != 0) {
+                            board->menu_key_pending_.store(true);
+                            Application::GetInstance().Schedule([board, status]() {
+                                board->HandleMenuKey((status & Pmic::kLongPress) != 0);
+                                board->menu_key_pending_.store(false);
+                            });
+                        }
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                }
+            },
+            "menu_key", 3072, this, 2, nullptr);
+        ESP_ERROR_CHECK(result == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    }
 
     void CancelEmergencyRestart() {
         emergency_restart_ready_.store(false);
@@ -550,8 +768,8 @@ private:
             boot_pressed_.store(true);
         }
 
-        if (!key3_pressed_.load() || !boot_pressed_.load() ||
-            emergency_restart_ready_.load() || emergency_restart_timer_running_.load()) {
+        if (!key3_pressed_.load() || !boot_pressed_.load() || emergency_restart_ready_.load() ||
+            emergency_restart_timer_running_.load()) {
             return;
         }
 
@@ -583,8 +801,7 @@ private:
 
         // Once the 10-second hold has completed, keep the restart armed while
         // either button is being released. Cancel only before the timer fires.
-        if (!emergency_restart_ready_.load() &&
-            (!key3_pressed_.load() || !boot_pressed_.load())) {
+        if (!emergency_restart_ready_.load() && (!key3_pressed_.load() || !boot_pressed_.load())) {
             CancelEmergencyRestart();
         }
     }
@@ -593,12 +810,13 @@ private:
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
-            GetBacklight()->SetBrightness(20); });
+            GetBacklight()->SetBrightness(20);
+        });
         power_save_timer_->OnExitSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(false);
-            GetBacklight()->RestoreBrightness(); });
-        power_save_timer_->OnShutdownRequest([this](){ 
-            pmic_->PowerOff(); });
+            GetBacklight()->RestoreBrightness();
+        });
+        power_save_timer_->OnShutdownRequest([this]() { pmic_->PowerOff(); });
         power_save_timer_->SetEnabled(true);
     }
 
@@ -609,9 +827,10 @@ private:
             .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
             .scl_io_num = AUDIO_CODEC_I2C_SCL_PIN,
             .clk_source = I2C_CLK_SRC_DEFAULT,
-            .flags = {
-                .enable_internal_pullup = 1,
-            },
+            .flags =
+                {
+                    .enable_internal_pullup = 1,
+                },
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
     }
@@ -636,16 +855,18 @@ private:
         buscfg.data1_io_num = EXAMPLE_PIN_NUM_LCD_DATA1;
         buscfg.data2_io_num = EXAMPLE_PIN_NUM_LCD_DATA2;
         buscfg.data3_io_num = EXAMPLE_PIN_NUM_LCD_DATA3;
-        buscfg.max_transfer_sz = DISPLAY_WIDTH*  DISPLAY_HEIGHT*  sizeof(uint16_t);
+        buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
         buscfg.flags = SPICOMMON_BUSFLAG_QUAD;
         ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
     }
 
     void InitializeButtons() {
         esp_timer_create_args_t emergency_restart_timer_args = {
-            .callback = [](void* arg) {
-                static_cast<WaveshareEsp32s3TouchAMOLED2inch16*>(arg)->OnEmergencyRestartTimer();
-            },
+            .callback =
+                [](void* arg) {
+                    static_cast<WaveshareEsp32s3TouchAMOLED2inch16*>(arg)
+                        ->OnEmergencyRestartTimer();
+                },
             .arg = this,
             .dispatch_method = ESP_TIMER_TASK,
             .name = "emergency_restart",
@@ -658,31 +879,53 @@ private:
         boot_button_.OnPressDown([this]() { OnEmergencyButtonPress(false); });
         boot_button_.OnPressUp([this]() { OnEmergencyButtonRelease(false); });
 
+        key3_button_.OnClick([this]() {
+            Application::GetInstance().Schedule([this]() { HandleMenuDirection(1); });
+        });
+        key3_button_.OnDoubleClick([this]() {
+            Application::GetInstance().Schedule([this]() {
+                HandleMenuDirection(1);
+                HandleMenuDirection(1);
+            });
+        });
         boot_button_.OnClick([this]() {
-            auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting) {
-                EnterWifiConfigMode();
-                return;
-            }
-            app.ToggleChatState();
+            Application::GetInstance().Schedule([this]() {
+                if (HandleMenuDirection(-1)) {
+                    return;
+                }
+                auto& app = Application::GetInstance();
+                if (app.GetDeviceState() == kDeviceStateStarting) {
+                    EnterWifiConfigMode();
+                    return;
+                }
+                app.ToggleChatState();
+            });
         });
 
-#if CONFIG_USE_DEVICE_AEC
         boot_button_.OnDoubleClick([this]() {
-            auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateIdle) {
-                app.SetAecMode(app.GetAecMode() == kAecOff ? kAecOnDeviceSide : kAecOff);
-            }
-        });
+            Application::GetInstance().Schedule([this]() {
+                // A double click in a menu is two downward selections.
+                if (menu_page_ != MenuPage::Closed) {
+                    HandleMenuDirection(-1);
+                    HandleMenuDirection(-1);
+                    return;
+                }
+#if CONFIG_USE_DEVICE_AEC
+                auto& app = Application::GetInstance();
+                if (app.GetDeviceState() == kDeviceStateIdle) {
+                    app.SetAecMode(app.GetAecMode() == kAecOff ? kAecOnDeviceSide : kAecOff);
+                }
 #endif
+            });
+        });
+        InitializeMenuKey();
     }
 
     static void OnTouchShortClick(lv_event_t* event) {
-        auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch16*>(
-            lv_event_get_user_data(event));
+        auto* board =
+            static_cast<WaveshareEsp32s3TouchAMOLED2inch16*>(lv_event_get_user_data(event));
         auto* indev = static_cast<lv_indev_t*>(lv_event_get_target(event));
-        if (board == nullptr || indev == nullptr ||
-            lv_indev_get_short_click_streak(indev) != 2) {
+        if (board == nullptr || indev == nullptr || lv_indev_get_short_click_streak(indev) != 2) {
             return;
         }
 
@@ -690,7 +933,7 @@ private:
         // the application task, just like other cross-task input callbacks.
         Application::GetInstance().Schedule([board]() {
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() != kDeviceStateIdle) {
+            if (board->menu_page_ != MenuPage::Closed || app.GetDeviceState() != kDeviceStateIdle) {
                 return;
             }
 
@@ -729,15 +972,16 @@ private:
         panel_config.reset_gpio_num = EXAMPLE_PIN_NUM_LCD_RST;
         panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
         panel_config.bits_per_pixel = 16;
-        panel_config.vendor_config = (void* )&vendor_config;
+        panel_config.vendor_config = (void*)&vendor_config;
         ESP_ERROR_CHECK(esp_lcd_new_panel_co5300(panel_io, &panel_config, &panel));
         esp_lcd_panel_reset(panel);
         esp_lcd_panel_init(panel);
         esp_lcd_panel_invert_color(panel, false);
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
         esp_lcd_panel_disp_on_off(panel, true);
-        display_ = new CustomLcdDisplay(panel_io, panel,
-                                        DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = new CustomLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                        DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
+                                        DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
         backlight_ = new CustomBacklight(panel_io);
         backlight_->RestoreBrightness();
     }
@@ -749,19 +993,21 @@ private:
             .y_max = DISPLAY_HEIGHT - 1,
             .rst_gpio_num = PIN_NUM_TOUCH_RST,
             .int_gpio_num = PIN_NUM_TOUCH_INT,
-            .levels = {
-                .reset = 0,
-                .interrupt = 0,
-            },
-            .flags = {
-                .swap_xy = 0,
-                .mirror_x = 1,
-                .mirror_y = 1,
-            },
+            .levels =
+                {
+                    .reset = 0,
+                    .interrupt = 0,
+                },
+            .flags =
+                {
+                    .swap_xy = 0,
+                    .mirror_x = 1,
+                    .mirror_y = 1,
+                },
         };
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
         esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_CST9217_CONFIG();
-        tp_io_config.scl_speed_hz = 400*  1000;
+        tp_io_config.scl_speed_hz = 400 * 1000;
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle));
         ESP_LOGI(TAG, "Initialize touch controller");
         ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_cst9217(tp_io_handle, &tp_cfg, &tp));
@@ -777,21 +1023,20 @@ private:
         // LVGL sends SHORT_CLICKED to the input device before dispatching
         // widget events. The second short click therefore represents a
         // double tap regardless of which UI object is underneath the finger.
-        lv_indev_add_event_cb(touch_indev, OnTouchShortClick,
-                              LV_EVENT_SHORT_CLICKED, this);
+        lv_indev_add_event_cb(touch_indev, OnTouchShortClick, LV_EVENT_SHORT_CLICKED, this);
         ESP_LOGI(TAG, "Touch panel initialized successfully");
     }
 
     // 初始化工具
     void InitializeTools() {
-        auto &mcp_server = McpServer::GetInstance();
+        auto& mcp_server = McpServer::GetInstance();
         mcp_server.AddTool("self.system.reconfigure_wifi",
-            "End this conversation and enter WiFi configuration mode.\n"
-            "**CAUTION** You must ask the user to confirm this action.",
-            PropertyList(), [this](const PropertyList& properties) {
-                EnterWifiConfigMode();
-                return true;
-            });
+                           "End this conversation and enter WiFi configuration mode.\n"
+                           "**CAUTION** You must ask the user to confirm this action.",
+                           PropertyList(), [this](const PropertyList& properties) {
+                               EnterWifiConfigMode();
+                               return true;
+                           });
     }
 
 public:
@@ -811,36 +1056,23 @@ public:
     }
 
     virtual AudioCodec* GetAudioCodec() override {
-        static BoxAudioCodec audio_codec(
-            i2c_bus_, 
-            AUDIO_INPUT_SAMPLE_RATE, 
-            AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_GPIO_MCLK, 
-            AUDIO_I2S_GPIO_BCLK, 
-            AUDIO_I2S_GPIO_WS, 
-            AUDIO_I2S_GPIO_DOUT, 
-            AUDIO_I2S_GPIO_DIN,
-            AUDIO_CODEC_PA_PIN, 
-            AUDIO_CODEC_ES8311_ADDR, 
-            AUDIO_CODEC_ES7210_ADDR, 
+        static MenuAudioCodec audio_codec(
+            i2c_bus_, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE, AUDIO_I2S_GPIO_MCLK,
+            AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN,
+            AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR, AUDIO_CODEC_ES7210_ADDR,
             AUDIO_INPUT_REFERENCE);
         return &audio_codec;
     }
 
-    virtual Display* GetDisplay() override {
-        return display_;
-    }
+    virtual Display* GetDisplay() override { return display_; }
 
-    virtual Backlight* GetBacklight() override {
-        return backlight_;
-    }
+    virtual Backlight* GetBacklight() override { return backlight_; }
 
-    virtual bool GetBatteryLevel(int &level, bool &charging, bool &discharging) override {
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
         static bool last_discharging = false;
         charging = pmic_->IsCharging();
         discharging = pmic_->IsDischarging();
-        if (discharging != last_discharging)
-        {
+        if (discharging != last_discharging) {
             power_save_timer_->SetEnabled(discharging);
             last_discharging = discharging;
         }

@@ -24,3 +24,15 @@ In the smaller form, the 2.16-inch capacitive HD AMOLED screen, highly integrate
 | <img style="width: 150px; height: auto; display: block; margin: 0 auto;" src= "https://www.waveshare.com/media/catalog/product/cache/1/image/560x560/9df78eab33525d08d6e5fb8d27136e95/e/s/esp32-s3-touch-amoled-2.16-1.jpg"> |
 | <img style="width: 150px; height: auto; display: block; margin: 0 auto;" src= "https://www.waveshare.com/media/catalog/product/cache/1/image/560x560/9df78eab33525d08d6e5fb8d27136e95/e/s/esp32-s3-touch-amoled-2.16-3.jpg"> |
 | <img style="width: 150px; height: auto; display: block; margin: 0 auto;" src= "https://www.waveshare.com/media/catalog/product/cache/1/image/560x560/9df78eab33525d08d6e5fb8d27136e95/e/s/esp32-s3-touch-amoled-2.16-4.jpg"> |
+
+## 三键设置菜单
+
+- 中间 `PWR` 短按打开菜单，再短按确认；长按约 2 秒返回上一级。
+- 上方 `GPIO18` / 下方 `BOOT` 选择图标，当前提供“音量”和“返回”。
+- 进入音量页后，上键增加、下键减少，每次 5%，范围 0–100%；中键确认后才应用并写入原有 `audio/output_volume` 设置。0% 静音在本板重启后保留。
+- 音量页长按中键 2 秒取消未保存的修改。保存后回到菜单，再选择“返回”或长按退出。
+- 菜单使用遮罩和浅紫圆角图标卡片，180ms 淡入并轻微上浮。菜单期间屏幕双击不会启动对话；菜单外 BOOT 的对话、双击 AEC（启用时）及上下键组合重启保持原行为。
+- 中键仍是 AXP2101 电源键，继续按住约 4 秒仍会硬件关机；返回后请松手。2 秒仅修改 IRQLEVEL，保留原有开关机阈值。
+- 按键通过独立任务每 50ms 读取 AXP2101 的 `0x49` 状态（短按 bit 3、长按 bit 2），仅清除已读取的按键标志。应用队列最多保留一个电源键处理回调。寄存器定义参考项目内 XPowersLib 的 `XPowersParams.hpp` / `XPowersAXP2101.hpp`。
+
+实机验收：短按打开/确认/保存，2 秒返回后松手不误确认，4 秒关机，连续上下键、0/100 边界、取消不改变声音、保存后重启（含静音）、休眠唤醒、对话过程中打开菜单，以及原有双击屏幕和组合键重启。编译及主机测试不能替代这些检查。
