@@ -597,6 +597,28 @@ private:
 #endif
     }
 
+    static void OnTouchShortClick(lv_event_t* event) {
+        auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch16*>(
+            lv_event_get_user_data(event));
+        auto* indev = static_cast<lv_indev_t*>(lv_event_get_target(event));
+        if (board == nullptr || indev == nullptr ||
+            lv_indev_get_short_click_streak(indev) != 2) {
+            return;
+        }
+
+        // LVGL callbacks run on the LVGL task. Run the wake/display work in
+        // the application task, just like other cross-task input callbacks.
+        Application::GetInstance().Schedule([board]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() != kDeviceStateIdle) {
+                return;
+            }
+
+            board->power_save_timer_->WakeUp();
+            app.ToggleChatState();
+        });
+    }
+
     void InitializeDisplay() {
         esp_lcd_panel_io_handle_t panel_io = nullptr;
         esp_lcd_panel_handle_t panel = nullptr;
@@ -667,7 +689,16 @@ private:
             .disp = lv_display_get_default(),
             .handle = tp,
         };
-        lvgl_port_add_touch(&touch_cfg);
+        auto* touch_indev = lvgl_port_add_touch(&touch_cfg);
+        if (touch_indev == nullptr) {
+            ESP_LOGE(TAG, "Failed to initialize touch input");
+            return;
+        }
+        // LVGL sends SHORT_CLICKED to the input device before dispatching
+        // widget events. The second short click therefore represents a
+        // double tap regardless of which UI object is underneath the finger.
+        lv_indev_add_event_cb(touch_indev, OnTouchShortClick,
+                              LV_EVENT_SHORT_CLICKED, this);
         ESP_LOGI(TAG, "Touch panel initialized successfully");
     }
 
