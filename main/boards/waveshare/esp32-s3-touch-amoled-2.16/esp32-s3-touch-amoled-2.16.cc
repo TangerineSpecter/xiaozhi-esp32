@@ -1,5 +1,6 @@
 #include "wifi_board.h"
 #include "display/lcd_display.h"
+#include "display/lvgl_display/lvgl_theme.h"
 #include "esp_lcd_co5300.h"
 
 #include "codecs/box_audio_codec.h"
@@ -24,8 +25,10 @@
 #include <esp_lcd_touch_cst9217.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
+#include <material_symbols.h>
 
 #include <atomic>
+#include <cstdio>
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch16"
 
@@ -84,12 +87,24 @@ static const co5300_lcd_init_cmd_t vendor_specific_init[] = {
 
 // 在waveshare_amoled_1_75类之前添加新的显示类
 class CustomLcdDisplay : public SpiLcdDisplay {
-public:
-    // The board-local character assets are 64x64 PNGs. Render them as a
-    // bottom-centered character instead of inheriting the tiny emoji layout.
+private:
     static constexpr lv_coord_t kEmotionSourceSize = 64;
     static constexpr lv_coord_t kEmotionImageSize = 216;  // 45% of the 480px display
-    static constexpr lv_coord_t kEmotionBottomMargin = 12;
+    static constexpr lv_coord_t kEmotionBottomMargin = 74;
+    static constexpr lv_coord_t kStatusBubbleWidth = 190;
+    static constexpr lv_coord_t kStatusBubbleHeight = 56;
+    static constexpr lv_coord_t kStatusBubbleTop = 160;
+    static constexpr lv_coord_t kChargingBubbleWidth = 174;
+    static constexpr lv_coord_t kChargingBubbleHeight = 54;
+    static constexpr lv_coord_t kChargingBubbleTop = 100;
+    static constexpr lv_coord_t kBottomBubbleWidthMargin = 24;
+    static constexpr lv_coord_t kBottomBubbleHeight = 66;
+    static constexpr lv_coord_t kBottomBubbleBottomMargin = 10;
+    static constexpr lv_coord_t kStaminaPanelWidth = 240;
+    static constexpr lv_coord_t kStaminaPanelHeight = 60;
+    static constexpr lv_coord_t kStaminaBarWidth = 208;
+    static constexpr lv_coord_t kStaminaBarHeight = 8;
+
     // LVGL keeps the image object's layout size at 64x64 while scaling its
     // drawing around the center pivot. Move the object up by the overscan so
     // the scaled drawing, rather than the unscaled object, sits on the bottom.
@@ -98,6 +113,196 @@ public:
     static constexpr uint16_t kEmotionImageScale =
         static_cast<uint16_t>((kEmotionImageSize * 256) / kEmotionSourceSize);
 
+    lv_obj_t* stamina_panel_ = nullptr;
+    lv_obj_t* stamina_label_ = nullptr;
+    lv_obj_t* stamina_bar_background_ = nullptr;
+    lv_obj_t* stamina_bar_fill_ = nullptr;
+    lv_obj_t* charging_panel_ = nullptr;
+    lv_obj_t* charging_label_ = nullptr;
+    lv_obj_t* charging_text_label_ = nullptr;
+
+    static lv_color_t StaminaColor(int level) {
+        if (level >= 60) {
+            return lv_color_hex(0x45C56B);
+        }
+        if (level >= 30) {
+            return lv_color_hex(0xF0B83F);
+        }
+        return lv_color_hex(0xE85B5B);
+    }
+
+    void UpdateStamina(int level, bool charging) {
+        if (stamina_panel_ == nullptr || stamina_label_ == nullptr ||
+            stamina_bar_fill_ == nullptr || charging_panel_ == nullptr ||
+            charging_label_ == nullptr || charging_text_label_ == nullptr) {
+            return;
+        }
+
+        if (level < 0) {
+            level = 0;
+        } else if (level > 100) {
+            level = 100;
+        }
+
+        lv_color_t color = StaminaColor(level);
+        char stamina_text[24];
+        std::snprintf(stamina_text, sizeof(stamina_text), "体力 %d/100", level);
+        lv_label_set_text(stamina_label_, stamina_text);
+        lv_obj_set_style_text_color(stamina_label_, color, 0);
+        lv_obj_set_style_bg_color(stamina_bar_fill_, color, 0);
+        lv_obj_set_width(stamina_bar_fill_, (kStaminaBarWidth * level) / 100);
+
+        if (charging) {
+            lv_label_set_text(charging_label_, MATERIAL_SYMBOLS_BATTERY_ANDROID_FRAME_BOLT);
+            lv_obj_remove_flag(charging_panel_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(charging_panel_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    void ApplyPetUiStyles() {
+        if (current_theme_ == nullptr) {
+            return;
+        }
+
+        auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+        lv_color_t bubble_color = lv_color_hex(0xFFF8FF);
+        lv_color_t bubble_border = lv_color_hex(0xA86BD8);
+        lv_color_t text_color = lv_color_hex(0x2B2140);
+
+        if (top_bar_ != nullptr) {
+            lv_obj_set_style_bg_opa(top_bar_, LV_OPA_TRANSP, 0);
+        }
+        if (battery_label_ != nullptr) {
+            // The board-specific stamina HUD replaces the small generic icon.
+            lv_obj_add_flag(battery_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        if (status_bar_ != nullptr) {
+            lv_obj_set_size(status_bar_, kStatusBubbleWidth, kStatusBubbleHeight);
+            lv_obj_set_style_bg_color(status_bar_, bubble_color, 0);
+            lv_obj_set_style_bg_opa(status_bar_, LV_OPA_90, 0);
+            lv_obj_set_style_radius(status_bar_, 24, 0);
+            lv_obj_set_style_border_width(status_bar_, 2, 0);
+            lv_obj_set_style_border_color(status_bar_, bubble_border, 0);
+            lv_obj_set_style_pad_all(status_bar_, 0, 0);
+            lv_obj_set_style_layout(status_bar_, LV_LAYOUT_NONE, 0);
+            lv_obj_align(status_bar_, LV_ALIGN_TOP_RIGHT, -16, kStatusBubbleTop);
+        }
+        if (status_label_ != nullptr) {
+            lv_obj_set_width(status_label_, kStatusBubbleWidth - 24);
+            lv_obj_set_style_text_color(status_label_, text_color, 0);
+            lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
+        }
+        if (notification_label_ != nullptr) {
+            lv_obj_set_width(notification_label_, kStatusBubbleWidth - 24);
+            lv_obj_set_style_text_color(notification_label_, text_color, 0);
+            lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_align(notification_label_, LV_ALIGN_CENTER, 0, 0);
+        }
+
+        if (bottom_bar_ != nullptr) {
+            lv_obj_set_size(bottom_bar_, LV_HOR_RES - kBottomBubbleWidthMargin,
+                            kBottomBubbleHeight);
+            lv_obj_set_style_bg_color(bottom_bar_, bubble_color, 0);
+            lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_90, 0);
+            lv_obj_set_style_radius(bottom_bar_, 20, 0);
+            lv_obj_set_style_border_width(bottom_bar_, 2, 0);
+            lv_obj_set_style_border_color(bottom_bar_, bubble_border, 0);
+            lv_obj_set_style_pad_left(bottom_bar_, 16, 0);
+            lv_obj_set_style_pad_right(bottom_bar_, 16, 0);
+            lv_obj_set_style_pad_top(bottom_bar_, 8, 0);
+            lv_obj_set_style_pad_bottom(bottom_bar_, 8, 0);
+            lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, -kBottomBubbleBottomMargin);
+        }
+        if (chat_message_label_ != nullptr) {
+            lv_obj_set_width(chat_message_label_, LV_HOR_RES - 56);
+            lv_obj_set_style_text_color(chat_message_label_, text_color, 0);
+            lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_align(chat_message_label_, LV_ALIGN_CENTER, 0, 0);
+        }
+
+        if (stamina_panel_ != nullptr) {
+            lv_obj_set_style_bg_color(stamina_panel_, bubble_color, 0);
+            lv_obj_set_style_bg_opa(stamina_panel_, LV_OPA_90, 0);
+            lv_obj_set_style_border_width(stamina_panel_, 2, 0);
+            lv_obj_set_style_border_color(stamina_panel_, bubble_border, 0);
+        }
+        if (stamina_label_ != nullptr) {
+            lv_obj_set_style_text_font(stamina_label_, lvgl_theme->text_font()->font(), 0);
+        }
+        if (charging_panel_ != nullptr) {
+            lv_obj_set_style_bg_color(charging_panel_, bubble_color, 0);
+            lv_obj_set_style_bg_opa(charging_panel_, LV_OPA_90, 0);
+            lv_obj_set_style_radius(charging_panel_, 22, 0);
+            lv_obj_set_style_border_width(charging_panel_, 2, 0);
+            lv_obj_set_style_border_color(charging_panel_, bubble_border, 0);
+        }
+        if (charging_label_ != nullptr) {
+            lv_obj_set_style_text_color(charging_label_, lv_color_hex(0x8F3FF0), 0);
+            lv_obj_set_style_text_font(charging_label_, lvgl_theme->large_icon_font()->font(), 0);
+        }
+        if (charging_text_label_ != nullptr) {
+            lv_obj_set_style_text_color(charging_text_label_, lv_color_hex(0x8F3FF0), 0);
+            lv_obj_set_style_text_font(charging_text_label_, lvgl_theme->text_font()->font(), 0);
+        }
+    }
+
+    void CreateStaminaHud() {
+        auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+        stamina_panel_ = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(stamina_panel_, kStaminaPanelWidth, kStaminaPanelHeight);
+        lv_obj_set_style_radius(stamina_panel_, 22, 0);
+        lv_obj_set_style_pad_all(stamina_panel_, 0, 0);
+        lv_obj_set_style_border_width(stamina_panel_, 2, 0);
+        lv_obj_set_scrollbar_mode(stamina_panel_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_align(stamina_panel_, LV_ALIGN_TOP_RIGHT, -12, 34);
+
+        stamina_label_ = lv_label_create(stamina_panel_);
+        lv_obj_set_width(stamina_label_, kStaminaPanelWidth - 42);
+        lv_obj_set_style_text_font(stamina_label_, lvgl_theme->text_font()->font(), 0);
+        lv_obj_align(stamina_label_, LV_ALIGN_TOP_LEFT, 12, 4);
+
+        charging_panel_ = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(charging_panel_, kChargingBubbleWidth, kChargingBubbleHeight);
+        lv_obj_set_style_radius(charging_panel_, 22, 0);
+        lv_obj_set_style_pad_all(charging_panel_, 0, 0);
+        lv_obj_set_style_border_width(charging_panel_, 2, 0);
+        lv_obj_set_scrollbar_mode(charging_panel_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_align(charging_panel_, LV_ALIGN_TOP_RIGHT, -18, kChargingBubbleTop);
+
+        charging_label_ = lv_label_create(charging_panel_);
+        lv_obj_set_style_text_font(charging_label_, lvgl_theme->large_icon_font()->font(), 0);
+        lv_obj_set_style_text_color(charging_label_, lv_color_hex(0x8F3FF0), 0);
+        lv_obj_align(charging_label_, LV_ALIGN_LEFT_MID, 12, 0);
+
+        charging_text_label_ = lv_label_create(charging_panel_);
+        lv_obj_set_style_text_font(charging_text_label_, lvgl_theme->text_font()->font(), 0);
+        lv_obj_set_style_text_color(charging_text_label_, lv_color_hex(0x8F3FF0), 0);
+        lv_label_set_text(charging_text_label_, "充电中 +1");
+        lv_obj_align(charging_text_label_, LV_ALIGN_LEFT_MID, 50, 0);
+        lv_obj_add_flag(charging_panel_, LV_OBJ_FLAG_HIDDEN);
+
+        stamina_bar_background_ = lv_obj_create(stamina_panel_);
+        lv_obj_set_size(stamina_bar_background_, kStaminaBarWidth, kStaminaBarHeight);
+        lv_obj_set_style_bg_color(stamina_bar_background_, lv_color_hex(0xE1D5E8), 0);
+        lv_obj_set_style_bg_opa(stamina_bar_background_, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(stamina_bar_background_, kStaminaBarHeight / 2, 0);
+        lv_obj_set_style_border_width(stamina_bar_background_, 0, 0);
+        lv_obj_align(stamina_bar_background_, LV_ALIGN_BOTTOM_LEFT, 16, -11);
+
+        stamina_bar_fill_ = lv_obj_create(stamina_bar_background_);
+        lv_obj_set_size(stamina_bar_fill_, 1, kStaminaBarHeight);
+        lv_obj_set_style_radius(stamina_bar_fill_, kStaminaBarHeight / 2, 0);
+        lv_obj_set_style_border_width(stamina_bar_fill_, 0, 0);
+        lv_obj_align(stamina_bar_fill_, LV_ALIGN_LEFT_MID, 0, 0);
+
+        ApplyPetUiStyles();
+        UpdateStamina(0, false);
+    }
+
+public:
     static void rounder_event_cb(lv_event_t* e) {
         lv_area_t* area = (lv_area_t* )lv_event_get_param(e);
         uint16_t x1 = area->x1;
@@ -140,9 +345,36 @@ public:
         lv_obj_align(emoji_box_, LV_ALIGN_TOP_MID, 0, 0);
         lv_obj_align(emoji_image_, LV_ALIGN_BOTTOM_MID, 0,
                      -(kEmotionBottomMargin + kEmotionScaleOverscan));
-        lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES*  0.1, 0);
-        lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES*  0.1, 0);
+        CreateStaminaHud();
+        ApplyPetUiStyles();
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+    }
+
+    virtual void SetTheme(Theme* theme) override {
+        SpiLcdDisplay::SetTheme(theme);
+        if (stamina_panel_ == nullptr) {
+            return;
+        }
+        DisplayLockGuard lock(this);
+        ApplyPetUiStyles();
+    }
+
+    virtual void UpdateStatusBar(bool update_all = false) override {
+        SpiLcdDisplay::UpdateStatusBar(update_all);
+        if (stamina_panel_ == nullptr) {
+            return;
+        }
+
+        int battery_level = 0;
+        bool charging = false;
+        bool discharging = false;
+        if (!Board::GetInstance().GetBatteryLevel(battery_level, charging, discharging)) {
+            return;
+        }
+        (void)discharging;
+
+        DisplayLockGuard lock(this);
+        UpdateStamina(battery_level, charging);
     }
 
     virtual void SetEmotion(const char* emotion) override {

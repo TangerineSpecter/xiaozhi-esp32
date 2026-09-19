@@ -368,6 +368,8 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_2_16)
     set(BUILTIN_ICON_FONT font_material_symbols_30_4)
     set(DEFAULT_EMOJI_COLLECTION
         "${PROJECT_DIR}/main/boards/waveshare/esp32-s3-touch-amoled-2.16/assets/emoji")
+    set(DEFAULT_ASSETS_EXTRA_FILES
+        "${PROJECT_DIR}/main/boards/waveshare/esp32-s3-touch-amoled-2.16/assets/background/pack")
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_1_43C)
     set(BOARD_DIR "waveshare/esp32-s3-touch-amoled-1.43c")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
@@ -1323,6 +1325,10 @@ function(build_default_assets_bin)
     # Add default assets extra files if defined
     if(DEFAULT_ASSETS_EXTRA_FILES)
         list(APPEND BUILD_ARGS "--extra_files" "${DEFAULT_ASSETS_EXTRA_FILES}")
+        file(GLOB_RECURSE DEFAULT_ASSETS_EXTRA_FILE_LIST CONFIGURE_DEPENDS
+            "${DEFAULT_ASSETS_EXTRA_FILES}/*"
+        )
+        list(APPEND DEFAULT_ASSETS_DEPENDENCIES ${DEFAULT_ASSETS_EXTRA_FILE_LIST})
     endif()
 
     list(APPEND BUILD_ARGS "--esp_sr_model_path" "${ESP_SR_MODEL_PATH}")

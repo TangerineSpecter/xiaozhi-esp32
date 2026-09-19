@@ -55,15 +55,20 @@ source /path/to/esp-idf/export.sh
 idf.py --version
 ```
 
+Use the activated environment's `python` command consistently. Do not mix
+`python` and `python3` for the same build directory: ESP-IDF records the
+absolute interpreter path in its build configuration, so switching names can
+require `idf.py fullclean`.
+
 ```sh
 # Discover exact board and variant names
-python3 scripts/build.py --list-boards
+python scripts/build.py --list-boards
 
 # Canonical variant build
-python3 scripts/build.py <board-directory> --name <variant-name>
+python scripts/build.py <board-directory> --name <variant-name>
 
 # Host-side build tests
-python3 -m unittest discover -s scripts/tests -v
+python -m unittest discover -s scripts/tests -v
 
 # Format/check touched files
 clang-format -i <files>

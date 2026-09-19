@@ -330,8 +330,24 @@ def process_extra_files(extra_files_dir, assets_dir):
     return extra_files_list
 
 
+def load_skin_config(extra_files_dir):
+    """Load an optional skin definition colocated with board assets."""
+    if not extra_files_dir:
+        return None
+
+    skin_path = os.path.join(extra_files_dir, "skin.json")
+    if not os.path.exists(skin_path):
+        return None
+
+    with open(skin_path, "r", encoding="utf-8") as f:
+        skin = json.load(f)
+    if not isinstance(skin, dict):
+        raise ValueError(f"Skin config must be a JSON object: {skin_path}")
+    return skin
+
+
 def generate_index_json(assets_dir, srmodels, text_font, emoji_collection, extra_files=None,
-                        multinet_model_info=None, font_bundle_id=None):
+                        multinet_model_info=None, font_bundle_id=None, skin=None):
     """Generate index.json file"""
     index_data = {
         "version": 1
@@ -366,6 +382,9 @@ def generate_index_json(assets_dir, srmodels, text_font, emoji_collection, extra
     
     if multinet_model_info:
         index_data["multinet_model"] = multinet_model_info
+
+    if skin:
+        index_data["skin"] = skin
     
     # Write index.json
     index_path = os.path.join(assets_dir, "index.json")
@@ -841,10 +860,11 @@ def build_assets_integrated(wakenet_model_paths, multinet_model_paths, text_font
         text_font = process_text_font(text_font_path, assets_dir) if text_font_path else None
         emoji_collection = process_emoji_collection(emoji_collection_path, assets_dir) if emoji_collection_path else None
         extra_files = process_extra_files(extra_files_path, assets_dir) if extra_files_path else None
+        skin = load_skin_config(extra_files_path) if extra_files_path else None
         
         # Generate index.json
         generate_index_json(assets_dir, srmodels, text_font, emoji_collection, extra_files,
-                            multinet_model_info, font_bundle_id)
+                            multinet_model_info, font_bundle_id, skin)
         
         # Generate config.json for packing
         config_path = generate_config_json(temp_build_dir, assets_dir)
