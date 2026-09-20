@@ -658,11 +658,15 @@ private:
     CustomBacklight* backlight_;
     esp_io_expander_handle_t io_expander = NULL;
     PowerSaveTimer* power_save_timer_;
+    esp_timer_handle_t deep_dim_timer_ = nullptr;
     esp_timer_handle_t emergency_restart_timer_ = nullptr;
     std::atomic_bool key3_pressed_{false};
     std::atomic_bool boot_pressed_{false};
     std::atomic_bool emergency_restart_timer_running_{false};
     std::atomic_bool emergency_restart_ready_{false};
+    enum class ScreenPowerStage { Awake, Dimmed, DeepDimmed };
+    std::atomic<ScreenPowerStage> screen_power_stage_{ScreenPowerStage::Awake};
+    std::atomic<int64_t> last_touch_tap_us_{0};
 
     enum class MenuPage { Closed, Settings, Volume };
     MenuPage menu_page_ = MenuPage::Closed;  // Application task only.
@@ -670,11 +674,30 @@ private:
     int menu_volume_ = 0;
     std::atomic_bool menu_key_pending_{false};
 
+    void StopDeepDimTimer() {
+        esp_err_t ret = esp_timer_stop(deep_dim_timer_);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Failed to stop deep-dim timer: %s", esp_err_to_name(ret));
+        }
+    }
+
+    bool WakeDisplayIfSleeping() {
+        if (screen_power_stage_.load() == ScreenPowerStage::Awake) {
+            return false;
+        }
+        last_touch_tap_us_.store(0);
+        power_save_timer_->WakeUp();
+        return true;
+    }
+
     void RefreshMenu(bool animate = false) {
         display_->ShowMenu(menu_page_ == MenuPage::Volume, menu_selection_, menu_volume_, animate);
     }
 
     void HandleMenuKey(bool back) {
+        if (WakeDisplayIfSleeping()) {
+            return;
+        }
         power_save_timer_->WakeUp();
         if (back) {
             if (menu_page_ == MenuPage::Volume) {
@@ -807,12 +830,40 @@ private:
     }
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        esp_timer_create_args_t deep_dim_timer_args = {
+            .callback =
+                [](void* arg) {
+                    auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch16*>(arg);
+                    if (board->screen_power_stage_.load() != ScreenPowerStage::Dimmed) {
+                        return;
+                    }
+                    board->screen_power_stage_.store(ScreenPowerStage::DeepDimmed);
+                    board->last_touch_tap_us_.store(0);
+                    board->GetBacklight()->SetBrightness(5);
+                    ESP_LOGI(TAG, "Display deeply dimmed; double tap to wake");
+                },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "display_deep_dim",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&deep_dim_timer_args, &deep_dim_timer_));
+
+        power_save_timer_ = new PowerSaveTimer(-1, 60, 600);
         power_save_timer_->OnEnterSleepMode([this]() {
+            screen_power_stage_.store(ScreenPowerStage::Dimmed);
+            last_touch_tap_us_.store(0);
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(20);
+            esp_err_t ret = esp_timer_start_once(deep_dim_timer_, 240 * 1000 * 1000);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to start deep-dim timer: %s", esp_err_to_name(ret));
+            }
         });
         power_save_timer_->OnExitSleepMode([this]() {
+            StopDeepDimTimer();
+            screen_power_stage_.store(ScreenPowerStage::Awake);
+            last_touch_tap_us_.store(0);
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
         });
@@ -880,16 +931,26 @@ private:
         boot_button_.OnPressUp([this]() { OnEmergencyButtonRelease(false); });
 
         key3_button_.OnClick([this]() {
-            Application::GetInstance().Schedule([this]() { HandleMenuDirection(1); });
+            Application::GetInstance().Schedule([this]() {
+                if (!WakeDisplayIfSleeping()) {
+                    HandleMenuDirection(1);
+                }
+            });
         });
         key3_button_.OnDoubleClick([this]() {
             Application::GetInstance().Schedule([this]() {
+                if (WakeDisplayIfSleeping()) {
+                    return;
+                }
                 HandleMenuDirection(1);
                 HandleMenuDirection(1);
             });
         });
         boot_button_.OnClick([this]() {
             Application::GetInstance().Schedule([this]() {
+                if (WakeDisplayIfSleeping()) {
+                    return;
+                }
                 if (HandleMenuDirection(-1)) {
                     return;
                 }
@@ -904,6 +965,9 @@ private:
 
         boot_button_.OnDoubleClick([this]() {
             Application::GetInstance().Schedule([this]() {
+                if (WakeDisplayIfSleeping()) {
+                    return;
+                }
                 // A double click in a menu is two downward selections.
                 if (menu_page_ != MenuPage::Closed) {
                     HandleMenuDirection(-1);
@@ -924,22 +988,30 @@ private:
     static void OnTouchShortClick(lv_event_t* event) {
         auto* board =
             static_cast<WaveshareEsp32s3TouchAMOLED2inch16*>(lv_event_get_user_data(event));
-        auto* indev = static_cast<lv_indev_t*>(lv_event_get_target(event));
-        if (board == nullptr || indev == nullptr || lv_indev_get_short_click_streak(indev) != 2) {
+        if (board == nullptr) {
             return;
         }
 
-        // LVGL callbacks run on the LVGL task. Run the wake/display work in
-        // the application task, just like other cross-task input callbacks.
-        Application::GetInstance().Schedule([board]() {
-            auto& app = Application::GetInstance();
-            if (board->menu_page_ != MenuPage::Closed || app.GetDeviceState() != kDeviceStateIdle) {
-                return;
-            }
+        auto stage = board->screen_power_stage_.load();
+        if (stage == ScreenPowerStage::Awake) {
+            board->last_touch_tap_us_.store(0);
+            return;
+        }
 
-            board->power_save_timer_->WakeUp();
-            app.ToggleChatState();
-        });
+        bool should_wake = stage == ScreenPowerStage::Dimmed;
+        if (stage == ScreenPowerStage::DeepDimmed) {
+            constexpr int64_t kDoubleTapWindowUs = 700 * 1000;
+            int64_t now = esp_timer_get_time();
+            int64_t previous = board->last_touch_tap_us_.exchange(now);
+            should_wake = previous > 0 && now - previous <= kDoubleTapWindowUs;
+        }
+        if (!should_wake) {
+            return;
+        }
+
+        // LVGL callbacks run on the LVGL task. Wake on the application task
+        // and consume the gesture instead of also starting a conversation.
+        Application::GetInstance().Schedule([board]() { board->WakeDisplayIfSleeping(); });
     }
 
     void InitializeDisplay() {
@@ -1020,9 +1092,10 @@ private:
             ESP_LOGE(TAG, "Failed to initialize touch input");
             return;
         }
-        // LVGL sends SHORT_CLICKED to the input device before dispatching
-        // widget events. The second short click therefore represents a
-        // double tap regardless of which UI object is underneath the finger.
+        // While lightly dimmed, one short tap wakes the display. In the
+        // deep-dim stage, the callback applies a relaxed time-only double-tap
+        // detector so the two taps do not need to land within LVGL's 10 px
+        // default streak radius.
         lv_indev_add_event_cb(touch_indev, OnTouchShortClick, LV_EVENT_SHORT_CLICKED, this);
         ESP_LOGI(TAG, "Touch panel initialized successfully");
     }
