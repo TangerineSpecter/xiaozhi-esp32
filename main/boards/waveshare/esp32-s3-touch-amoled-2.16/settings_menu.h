@@ -1,9 +1,12 @@
 #pragma once
 
+#include <algorithm>
+
 #include <lvgl.h>
 #include <material_symbols.h>
 
-// Board-local overlay. All methods must run under the display lock.
+// Board-local overlay. UI updates run under the display lock; hit testing runs
+// on the LVGL task and only reads the existing objects.
 class SettingsMenu {
 private:
     lv_obj_t* overlay_ = nullptr;
@@ -14,6 +17,18 @@ private:
     lv_obj_t* value_ = nullptr;
     lv_obj_t* bar_ = nullptr;
     lv_obj_t* hint_ = nullptr;
+    bool visible_ = false;
+    bool editing_ = false;
+
+    static bool Contains(const lv_area_t& area, lv_coord_t x, lv_coord_t y) {
+        return x >= area.x1 && x <= area.x2 && y >= area.y1 && y <= area.y2;
+    }
+
+    static lv_area_t Coordinates(lv_obj_t* object) {
+        lv_area_t area = {};
+        lv_obj_get_coords(object, &area);
+        return area;
+    }
 
     static lv_obj_t* Label(lv_obj_t* parent, const char* text, int y) {
         auto* label = lv_label_create(parent);
@@ -23,11 +38,19 @@ private:
     }
 
 public:
+    struct TouchTarget {
+        bool outside = true;
+        int menu_index = -1;
+        bool volume_bar = false;
+        int volume = 0;
+    };
+
     void Destroy() {
         if (overlay_ != nullptr) {
             lv_obj_delete(overlay_);
             overlay_ = nullptr;
         }
+        visible_ = false;
     }
 
     void Create(lv_display_t* display, const lv_font_t* text_font, const lv_font_t* icon_font) {
@@ -88,6 +111,8 @@ public:
         if (overlay_ == nullptr) {
             return;
         }
+        visible_ = true;
+        editing_ = editing;
         lv_obj_remove_flag(overlay_, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(title_, editing ? "音量设置" : "设置");
         lv_label_set_text(card_names_[1], audio_recording ? "停止录音" : "录音");
@@ -126,5 +151,36 @@ public:
         if (overlay_ != nullptr) {
             lv_obj_add_flag(overlay_, LV_OBJ_FLAG_HIDDEN);
         }
+        visible_ = false;
+    }
+
+    TouchTarget HitTestTouch(lv_coord_t x, lv_coord_t y) const {
+        TouchTarget target;
+        if (!visible_ || overlay_ == nullptr || lv_obj_has_flag(overlay_, LV_OBJ_FLAG_HIDDEN)) {
+            return target;
+        }
+
+        if (!Contains(Coordinates(panel_), x, y)) {
+            return target;
+        }
+        target.outside = false;
+        if (editing_) {
+            const lv_area_t bar_area = Coordinates(bar_);
+            if (Contains(bar_area, x, y)) {
+                target.volume_bar = true;
+                const int width = std::max(1, static_cast<int>(bar_area.x2 - bar_area.x1 + 1));
+                const int offset = static_cast<int>(x - bar_area.x1);
+                target.volume = std::clamp(offset * 100 / width, 0, 100);
+            }
+            return target;
+        }
+
+        for (int i = 0; i < 4; ++i) {
+            if (Contains(Coordinates(cards_[i]), x, y)) {
+                target.menu_index = i;
+                break;
+            }
+        }
+        return target;
     }
 };

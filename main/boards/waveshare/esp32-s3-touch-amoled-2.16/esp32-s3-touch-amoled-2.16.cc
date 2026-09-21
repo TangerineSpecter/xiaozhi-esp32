@@ -7,9 +7,9 @@
 #include "application.h"
 #include "axp2101.h"
 #include "button.h"
+#include "capture_storage.h"
 #include "codecs/box_audio_codec.h"
 #include "config.h"
-#include "capture_storage.h"
 #include "i2c_device.h"
 #include "led/single_led.h"
 #include "mcp_server.h"
@@ -523,6 +523,10 @@ public:
         menu_.Show(editing, selected, volume, audio_recording, notes_active, animate);
     }
 
+    SettingsMenu::TouchTarget HitTestMenuTouch(lv_coord_t x, lv_coord_t y) const {
+        return menu_.HitTestTouch(x, y);
+    }
+
     void HideMenu() {
         DisplayLockGuard lock(this);
         menu_.Hide();
@@ -1020,6 +1024,25 @@ private:
         }
     }
 
+    void HandleMenuTouch(const SettingsMenu::TouchTarget& target) {
+        if (!menu_open_.load()) {
+            return;
+        }
+        if (target.outside) {
+            HandleMenuKey(true);
+            return;
+        }
+        if (menu_page_ == MenuPage::Volume && target.volume_bar) {
+            menu_volume_ = target.volume;
+            RefreshMenu();
+            return;
+        }
+        if (menu_page_ == MenuPage::Settings && target.menu_index >= 0) {
+            menu_selection_ = target.menu_index;
+            HandleMenuKey(false);
+        }
+    }
+
     bool IsShakeReactionAllowed() const {
         if (screen_power_stage_.load() != ScreenPowerStage::Awake || menu_open_.load() ||
             capture_storage_.IsAudioRecording() || capture_storage_.IsTextNotesActive()) {
@@ -1452,6 +1475,17 @@ private:
         auto stage = board->screen_power_stage_.load();
         if (stage == ScreenPowerStage::Awake) {
             board->last_touch_tap_us_.store(0);
+            if (board->menu_open_.load()) {
+                lv_indev_t* indev = lv_indev_get_act();
+                if (indev == nullptr) {
+                    return;
+                }
+                lv_point_t point = {};
+                lv_indev_get_point(indev, &point);
+                const auto target = board->display_->HitTestMenuTouch(point.x, point.y);
+                Application::GetInstance().Schedule(
+                    [board, target]() { board->HandleMenuTouch(target); });
+            }
             return;
         }
 
