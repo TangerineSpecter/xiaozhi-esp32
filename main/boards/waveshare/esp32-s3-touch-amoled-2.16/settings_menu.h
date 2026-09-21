@@ -9,7 +9,8 @@ private:
     lv_obj_t* overlay_ = nullptr;
     lv_obj_t* panel_ = nullptr;
     lv_obj_t* title_ = nullptr;
-    lv_obj_t* cards_[2] = {};
+    lv_obj_t* cards_[4] = {};
+    lv_obj_t* card_names_[4] = {};
     lv_obj_t* value_ = nullptr;
     lv_obj_t* bar_ = nullptr;
     lv_obj_t* hint_ = nullptr;
@@ -43,7 +44,7 @@ public:
         lv_obj_add_flag(overlay_, LV_OBJ_FLAG_HIDDEN);
 
         panel_ = lv_obj_create(overlay_);
-        lv_obj_set_size(panel_, 340, 308);
+        lv_obj_set_size(panel_, 340, 410);
         lv_obj_align(panel_, LV_ALIGN_CENTER, 0, 0);
         lv_obj_remove_flag(panel_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_pad_all(panel_, 0, 0);
@@ -55,39 +56,43 @@ public:
         lv_obj_set_style_text_color(panel_, lv_color_hex(0x2B2140), 0);
         title_ = Label(panel_, "设置", 22);
 
-        const char* icons[] = {MATERIAL_SYMBOLS_VOLUME_UP, MATERIAL_SYMBOLS_ARROW_BACK};
-        const char* names[] = {"音量", "返回"};
-        for (int i = 0; i < 2; ++i) {
+        const char* icons[] = {MATERIAL_SYMBOLS_VOLUME_UP, MATERIAL_SYMBOLS_MIC,
+                               MATERIAL_SYMBOLS_EDIT_SQUARE, MATERIAL_SYMBOLS_ARROW_BACK};
+        const char* names[] = {"音量", "录音", "记录", "返回"};
+        for (int i = 0; i < 4; ++i) {
             cards_[i] = lv_obj_create(panel_);
-            lv_obj_set_size(cards_[i], 124, 120);
-            lv_obj_set_pos(cards_[i], 36 + i * 140, 74);
+            lv_obj_set_size(cards_[i], 124, 110);
+            lv_obj_set_pos(cards_[i], 36 + (i % 2) * 140, 66 + (i / 2) * 122);
             lv_obj_set_style_pad_all(cards_[i], 0, 0);
             lv_obj_set_style_radius(cards_[i], 22, 0);
             lv_obj_remove_flag(cards_[i], LV_OBJ_FLAG_SCROLLABLE);
-            auto* icon = Label(cards_[i], icons[i], 24);
+            auto* icon = Label(cards_[i], icons[i], 18);
             lv_obj_set_style_text_font(icon, icon_font, 0);
-            Label(cards_[i], names[i], 70);
+            card_names_[i] = Label(cards_[i], names[i], 65);
         }
-        value_ = Label(panel_, "", 98);
+        value_ = Label(panel_, "", 110);
         bar_ = lv_bar_create(panel_);
         lv_obj_set_size(bar_, 244, 16);
-        lv_obj_align(bar_, LV_ALIGN_TOP_MID, 0, 163);
+        lv_obj_align(bar_, LV_ALIGN_TOP_MID, 0, 180);
         lv_bar_set_range(bar_, 0, 100);
         lv_obj_set_style_bg_color(bar_, lv_color_hex(0xE7DEED), LV_PART_MAIN);
         lv_obj_set_style_bg_color(bar_, lv_color_hex(0x9C76C6), LV_PART_INDICATOR);
-        hint_ = Label(panel_, "", 219);
+        hint_ = Label(panel_, "", 330);
         lv_obj_set_width(hint_, 300);
         lv_obj_set_style_text_align(hint_, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_line_space(hint_, 8, 0);
     }
 
-    void Show(bool editing, int selected, int volume, bool animate) {
+    void Show(bool editing, int selected, int volume, bool audio_recording, bool notes_active,
+              bool animate) {
         if (overlay_ == nullptr) {
             return;
         }
         lv_obj_remove_flag(overlay_, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(title_, editing ? "音量设置" : "设置");
-        for (int i = 0; i < 2; ++i) {
+        lv_label_set_text(card_names_[1], audio_recording ? "停止录音" : "录音");
+        lv_label_set_text(card_names_[2], notes_active ? "停止记录" : "记录");
+        for (int i = 0; i < 4; ++i) {
             lv_obj_set_flag(cards_[i], LV_OBJ_FLAG_HIDDEN, editing);
             lv_obj_set_style_bg_color(cards_[i], lv_color_hex(i == selected ? 0xEBDDF6 : 0xF7F0FA),
                                       0);
@@ -99,6 +104,7 @@ public:
         lv_obj_set_flag(bar_, LV_OBJ_FLAG_HIDDEN, !editing);
         lv_label_set_text_fmt(value_, "%d%%", volume);
         lv_bar_set_value(bar_, volume, LV_ANIM_OFF);
+        lv_obj_align(hint_, LV_ALIGN_TOP_MID, 0, editing ? 245 : 330);
         lv_label_set_text(hint_, editing ? "上 / 下 调整 · 中键保存\n长按中键 2 秒取消"
                                          : "上 / 下 选择 · 中键确认\n长按中键 2 秒返回");
         if (animate) {

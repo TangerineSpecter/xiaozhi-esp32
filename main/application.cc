@@ -18,8 +18,28 @@
 #include <cJSON.h>
 #include <cstring>
 #include <limits>
+#include <string_view>
 
 #define TAG "Application"
+
+namespace {
+
+std::string GetDisplayText(const char* text) {
+    if (text == nullptr) {
+        return {};
+    }
+
+    const std::string_view text_view(text);
+    if (text_view.starts_with("% get_weather")) {
+        return Lang::Strings::TOOL_GET_WEATHER;
+    }
+    if (text_view.starts_with("% search_news")) {
+        return Lang::Strings::TOOL_SEARCH_NEWS;
+    }
+    return text;
+}
+
+}  // namespace
 
 Application::Application() : notify_player_(audio_service_) {
     event_group_ = xEventGroupCreate();
@@ -215,6 +235,14 @@ void Application::Run() {
         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
             if (audio_service_.IsPlaybackIdle()) {
                 notify_player_.OnPlaybackDrained();
+            }
+            if (local_reaction_resume_listening_ && audio_service_.IsPlaybackIdle()) {
+                local_reaction_resume_listening_ = false;
+                if (GetDeviceState() == kDeviceStateListening && protocol_ &&
+                    protocol_->IsAudioChannelOpened()) {
+                    audio_service_.EnableVoiceProcessing(true);
+                    ConfigureWakeWordForListening();
+                }
             }
             // Deferred listening start (auto mode): the playback queue has
             // drained, so it is now safe to enable voice processing.
@@ -645,7 +673,7 @@ void Application::InitializeProtocol() {
                         glyphs.clear();
                     }
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring),
+                    Schedule([display, message = GetDisplayText(text->valuestring),
                               glyphs = std::move(glyphs), bpp]() {
                         display->AddTextGlyphs(glyphs, bpp);
                         display->SetChatMessage("assistant", message.c_str());
@@ -663,6 +691,7 @@ void Application::InitializeProtocol() {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
                 Schedule([display, message = std::string(text->valuestring),
                           glyphs = std::move(glyphs), bpp]() {
+                    Board::GetInstance().OnUserTranscription(message);
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
                 });
@@ -998,6 +1027,9 @@ void Application::HandleStateChangedEvent() {
     // Any state change invalidates a pending deferred listening start;
     // the Listening case below re-arms it when needed.
     pending_listening_start_ = false;
+    if (new_state != kDeviceStateListening) {
+        local_reaction_resume_listening_ = false;
+    }
 
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
@@ -1358,6 +1390,19 @@ void Application::SetAecMode(AecMode mode) {
 }
 
 void Application::PlaySound(const std::string_view& sound) { audio_service_.PlaySound(sound); }
+
+bool Application::TryPlayLocalReactionSound(const std::string_view& sound) {
+    if (sound.empty() || GetDeviceState() != kDeviceStateListening || protocol_ == nullptr ||
+        !protocol_->IsAudioChannelOpened() || !audio_service_.IsPlaybackIdle() ||
+        local_reaction_resume_listening_) {
+        return false;
+    }
+
+    audio_service_.EnableVoiceProcessing(false);
+    local_reaction_resume_listening_ = true;
+    audio_service_.PlaySound(sound);
+    return true;
+}
 
 void Application::ResetProtocol() {
     Schedule([this]() {

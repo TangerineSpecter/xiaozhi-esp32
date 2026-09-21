@@ -9,10 +9,12 @@
 #include "button.h"
 #include "codecs/box_audio_codec.h"
 #include "config.h"
+#include "capture_storage.h"
 #include "i2c_device.h"
 #include "led/single_led.h"
 #include "mcp_server.h"
 #include "power_save_timer.h"
+#include "qmi8658.h"
 
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
@@ -25,6 +27,7 @@
 #include "settings_menu.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include <esp_lcd_touch_cst9217.h>
 #include <esp_lvgl_port.h>
@@ -34,9 +37,18 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <string>
+#include <string_view>
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch16"
+
+#if WAVESHARE_DIZZY_SOUND_EMBEDDED
+extern const char dizzy_ogg_start[] asm("_binary_dizzy_ogg_start");
+extern const char dizzy_ogg_end[] asm("_binary_dizzy_ogg_end");
+static const std::string_view kDizzySound{dizzy_ogg_start,
+                                          static_cast<size_t>(dizzy_ogg_end - dizzy_ogg_start)};
+#endif
 
 class Pmic : public Axp2101 {
 public:
@@ -126,6 +138,7 @@ private:
     static constexpr lv_coord_t kEmotionSourceSize = 108;
     static constexpr lv_coord_t kEmotionImageSize = 300;
     static constexpr lv_coord_t kEmotionBottomMargin = 0;
+    static constexpr lv_coord_t kDizzyBottomOverscan = 8;
     static constexpr lv_coord_t kStatusBubbleWidth = 152;
     static constexpr lv_coord_t kStatusBubbleHeight = 32;
     static constexpr lv_coord_t kStatusBubbleTop = 36;
@@ -155,13 +168,72 @@ private:
     lv_obj_t* stamina_bar_fill_ = nullptr;
     lv_obj_t* charging_label_ = nullptr;
     lv_timer_t* speech_timer_ = nullptr;
+    lv_timer_t* capture_timer_ = nullptr;
+    lv_obj_t* recording_badge_ = nullptr;
+    lv_obj_t* recording_label_ = nullptr;
+    lv_obj_t* recording_wave_bars_[3] = {};
+    lv_obj_t* notes_badge_ = nullptr;
+    lv_obj_t* notes_icon_ = nullptr;
+    lv_obj_t* notes_label_ = nullptr;
     std::string speech_text_;
     size_t speech_offset_ = 0;
+    bool dizzy_active_ = false;
+    bool recording_active_ = false;
+    bool notes_active_ = false;
+    int64_t recording_started_us_ = 0;
+    std::string pending_emotion_ = "neutral";
+
+    void UpdateCaptureBadges() {
+        if (recording_badge_ == nullptr || notes_badge_ == nullptr) {
+            return;
+        }
+        lv_obj_set_flag(recording_badge_, LV_OBJ_FLAG_HIDDEN, !recording_active_);
+        lv_obj_set_flag(notes_badge_, LV_OBJ_FLAG_HIDDEN, !notes_active_);
+        lv_obj_align(notes_badge_, recording_active_ ? LV_ALIGN_BOTTOM_RIGHT : LV_ALIGN_BOTTOM_MID,
+                     recording_active_ ? -24 : 0, recording_active_ ? -64 : -18);
+        if (recording_active_) {
+            int64_t elapsed =
+                std::max<int64_t>(0, esp_timer_get_time() - recording_started_us_) / 1000000;
+            lv_label_set_text_fmt(recording_label_, "● REC %02lld:%02lld",
+                                  static_cast<long long>(elapsed / 60),
+                                  static_cast<long long>(elapsed % 60));
+            const lv_coord_t wave_heights[3][3] = {{6, 14, 9}, {12, 7, 15}, {9, 15, 6}};
+            for (int i = 0; i < 3; ++i) {
+                lv_obj_set_height(recording_wave_bars_[i], wave_heights[elapsed % 3][i]);
+            }
+        }
+    }
+
+    void ApplyEmotion(const char* emotion) {
+        SpiLcdDisplay::SetEmotion(emotion);
+
+        DisplayLockGuard lock(this);
+        if (emoji_image_ == nullptr || lv_obj_has_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN)) {
+            return;
+        }
+
+        lv_image_set_scale(emoji_image_, kEmotionImageScale);
+        lv_image_set_antialias(emoji_image_, false);
+        // Taller animations reserve room above the head for effects. Keep the
+        // same character scale and bottom edge instead of shrinking them to fit.
+        const lv_coord_t source_height = lv_image_get_src_height(emoji_image_);
+        const lv_coord_t scale_overscan =
+            (source_height * kEmotionScaleOverscan + kEmotionSourceSize / 2) / kEmotionSourceSize;
+        const lv_coord_t bottom_overscan =
+            std::strcmp(emotion, "dizzy") == 0
+                ? (kDizzyBottomOverscan * kEmotionImageSize + kEmotionSourceSize / 2) /
+                      kEmotionSourceSize
+                : 0;
+        lv_obj_align(emoji_image_, LV_ALIGN_BOTTOM_MID, 0,
+                     -(kEmotionBottomMargin + scale_overscan - bottom_overscan));
+    }
 
     // Draw on the status label itself so notifications hide the dot too.
-    static void DrawSpeakingDot(lv_event_t* event) {
+    static void DrawVoiceStatusDot(lv_event_t* event) {
         auto* label = lv_event_get_target_obj(event);
-        if (std::strcmp(lv_label_get_text(label), Lang::Strings::SPEAKING) != 0) {
+        const char* status = lv_label_get_text(label);
+        if (std::strcmp(status, Lang::Strings::LISTENING) != 0 &&
+            std::strcmp(status, Lang::Strings::SPEAKING) != 0) {
             return;
         }
         lv_area_t area;
@@ -331,9 +403,9 @@ private:
         }
         if (status_label_ != nullptr) {
             lv_obj_set_width(status_label_, kStatusBubbleWidth - 24);
-            const bool speaking =
-                std::strcmp(lv_label_get_text(status_label_), Lang::Strings::SPEAKING) == 0;
-            lv_obj_set_style_pad_left(status_label_, speaking ? 16 : 0, 0);
+            // Keep both voice statuses at the listening text position. The dot
+            // is drawn in the label's left-side empty area.
+            lv_obj_set_style_pad_left(status_label_, 0, 0);
             lv_obj_set_style_text_color(status_label_, text_color, 0);
             lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
@@ -388,6 +460,12 @@ private:
             lv_obj_set_style_text_color(charging_label_, lv_color_hex(0x45C56B), 0);
             lv_obj_set_style_text_font(charging_label_, lvgl_theme->icon_font()->font(), 0);
         }
+        if (notes_icon_ != nullptr) {
+            lv_obj_set_style_text_font(notes_icon_, lvgl_theme->icon_font()->font(), 0);
+        }
+        if (notes_label_ != nullptr) {
+            lv_obj_set_style_text_font(notes_label_, lvgl_theme->text_font()->font(), 0);
+        }
     }
 
     void CreateStaminaHud() {
@@ -434,14 +512,15 @@ private:
     }
 
 public:
-    void ShowMenu(bool editing, int selected, int volume, bool animate = false) {
+    void ShowMenu(bool editing, int selected, int volume, bool audio_recording, bool notes_active,
+                  bool animate = false) {
         DisplayLockGuard lock(this);
         if (current_theme_ == nullptr) {
             return;
         }
         auto* theme = static_cast<LvglTheme*>(current_theme_);
         menu_.Create(display_, theme->text_font()->font(), theme->icon_font()->font());
-        menu_.Show(editing, selected, volume, animate);
+        menu_.Show(editing, selected, volume, audio_recording, notes_active, animate);
     }
 
     void HideMenu() {
@@ -454,6 +533,9 @@ public:
         menu_.Destroy();
         if (speech_timer_ != nullptr) {
             lv_timer_delete(speech_timer_);
+        }
+        if (capture_timer_ != nullptr) {
+            lv_timer_delete(capture_timer_);
         }
     }
 
@@ -486,9 +568,9 @@ public:
         {
             DisplayLockGuard lock(this);
             if (status_label_ != nullptr) {
-                const bool speaking =
-                    status != nullptr && std::strcmp(status, Lang::Strings::SPEAKING) == 0;
-                lv_obj_set_style_pad_left(status_label_, speaking ? 16 : 0, 0);
+                // Do not shift the text when switching between listening and
+                // speaking; both states share the same fixed layout.
+                lv_obj_set_style_pad_left(status_label_, 0, 0);
             }
         }
         if (status != nullptr && std::strcmp(status, Lang::Strings::LISTENING) == 0) {
@@ -552,7 +634,7 @@ public:
             lv_obj_refresh_ext_draw_size(bottom_bar_);
         }
         if (status_label_ != nullptr) {
-            lv_obj_add_event_cb(status_label_, DrawSpeakingDot, LV_EVENT_DRAW_MAIN_END, nullptr);
+            lv_obj_add_event_cb(status_label_, DrawVoiceStatusDot, LV_EVENT_DRAW_MAIN_END, nullptr);
         }
         CreateStaminaHud();
         speech_timer_ = lv_timer_create(
@@ -564,6 +646,54 @@ public:
             },
             kSpeechPageDurationMs, this);
         lv_timer_pause(speech_timer_);
+
+        recording_badge_ = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(recording_badge_, 200, 40);
+        lv_obj_align(recording_badge_, LV_ALIGN_BOTTOM_MID, 0, -16);
+        lv_obj_set_style_radius(recording_badge_, 20, 0);
+        lv_obj_set_style_bg_color(recording_badge_, lv_color_hex(0x321C3E), 0);
+        lv_obj_set_style_bg_opa(recording_badge_, LV_OPA_80, 0);
+        lv_obj_set_style_border_color(recording_badge_, lv_color_hex(0xFF5B6E), 0);
+        lv_obj_set_style_border_width(recording_badge_, 2, 0);
+        lv_obj_remove_flag(recording_badge_, LV_OBJ_FLAG_SCROLLABLE);
+        recording_label_ = lv_label_create(recording_badge_);
+        lv_obj_align(recording_label_, LV_ALIGN_CENTER, -12, 0);
+        lv_obj_set_style_text_color(recording_label_, lv_color_hex(0xFF6B7C), 0);
+        for (int i = 0; i < 3; ++i) {
+            recording_wave_bars_[i] = lv_obj_create(recording_badge_);
+            lv_obj_set_size(recording_wave_bars_[i], 3, 8);
+            lv_obj_align(recording_wave_bars_[i], LV_ALIGN_RIGHT_MID, -21 + i * 7, 0);
+            lv_obj_set_style_radius(recording_wave_bars_[i], 2, 0);
+            lv_obj_set_style_bg_color(recording_wave_bars_[i], lv_color_hex(0xFF6B7C), 0);
+            lv_obj_set_style_border_width(recording_wave_bars_[i], 0, 0);
+            lv_obj_set_style_pad_all(recording_wave_bars_[i], 0, 0);
+            lv_obj_remove_flag(recording_wave_bars_[i], LV_OBJ_FLAG_SCROLLABLE);
+        }
+
+        notes_badge_ = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(notes_badge_, 116, 34);
+        lv_obj_set_style_radius(notes_badge_, 17, 0);
+        lv_obj_set_style_bg_color(notes_badge_, lv_color_hex(0xF7F0FA), 0);
+        lv_obj_set_style_bg_opa(notes_badge_, LV_OPA_90, 0);
+        lv_obj_set_style_border_color(notes_badge_, lv_color_hex(0x9C76C6), 0);
+        lv_obj_set_style_border_width(notes_badge_, 1, 0);
+        lv_obj_remove_flag(notes_badge_, LV_OBJ_FLAG_SCROLLABLE);
+        notes_icon_ = lv_label_create(notes_badge_);
+        lv_label_set_text(notes_icon_, MATERIAL_SYMBOLS_EDIT_SQUARE);
+        lv_obj_align(notes_icon_, LV_ALIGN_LEFT_MID, 12, 0);
+        lv_obj_set_style_text_color(notes_icon_, lv_color_hex(0x5D3D78), 0);
+        notes_label_ = lv_label_create(notes_badge_);
+        lv_label_set_text(notes_label_, "记录中");
+        lv_obj_align(notes_label_, LV_ALIGN_CENTER, 13, 0);
+        lv_obj_set_style_text_color(notes_label_, lv_color_hex(0x5D3D78), 0);
+
+        capture_timer_ = lv_timer_create(
+            [](lv_timer_t* timer) {
+                auto* display = static_cast<CustomLcdDisplay*>(lv_timer_get_user_data(timer));
+                display->UpdateCaptureBadges();
+            },
+            1000, this);
+        UpdateCaptureBadges();
         ApplyPetUiStyles();
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
     }
@@ -600,17 +730,55 @@ public:
     }
 
     virtual void SetEmotion(const char* emotion) override {
-        SpiLcdDisplay::SetEmotion(emotion);
-
-        DisplayLockGuard lock(this);
-        if (emoji_image_ == nullptr || lv_obj_has_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN)) {
+        const char* requested = emotion != nullptr && emotion[0] != '\0' ? emotion : "neutral";
+        pending_emotion_ = requested;
+        if (dizzy_active_ || recording_active_ || notes_active_) {
             return;
         }
+        ApplyEmotion(requested);
+    }
 
-        lv_image_set_scale(emoji_image_, kEmotionImageScale);
-        lv_image_set_antialias(emoji_image_, false);
-        lv_obj_align(emoji_image_, LV_ALIGN_BOTTOM_MID, 0,
-                     -(kEmotionBottomMargin + kEmotionScaleOverscan));
+    void StartDizzy() {
+        if (dizzy_active_ || recording_active_ || notes_active_) {
+            return;
+        }
+        dizzy_active_ = true;
+        ApplyEmotion("dizzy");
+    }
+
+    void StopDizzy() {
+        if (!dizzy_active_) {
+            return;
+        }
+        dizzy_active_ = false;
+        if (recording_active_) {
+            ApplyEmotion("recording");
+        } else if (notes_active_) {
+            ApplyEmotion("taking_notes");
+        } else {
+            ApplyEmotion(pending_emotion_.empty() ? "neutral" : pending_emotion_.c_str());
+        }
+    }
+
+    void SetCaptureState(bool audio_recording, bool text_notes) {
+        bool capture_changed = recording_active_ != audio_recording || notes_active_ != text_notes;
+        bool recording_started = !recording_active_ && audio_recording;
+        recording_active_ = audio_recording;
+        notes_active_ = text_notes;
+        if (recording_started) {
+            recording_started_us_ = esp_timer_get_time();
+        }
+        if (capture_changed) {
+            if (recording_active_) {
+                ApplyEmotion("recording");
+            } else if (notes_active_) {
+                ApplyEmotion("taking_notes");
+            } else {
+                ApplyEmotion(pending_emotion_.empty() ? "neutral" : pending_emotion_.c_str());
+            }
+        }
+        DisplayLockGuard lock(this);
+        UpdateCaptureBadges();
     }
 };
 
@@ -656,6 +824,7 @@ private:
     Button boot_button_;
     CustomLcdDisplay* display_;
     CustomBacklight* backlight_;
+    CaptureStorage capture_storage_;
     esp_io_expander_handle_t io_expander = NULL;
     PowerSaveTimer* power_save_timer_;
     esp_timer_handle_t deep_dim_timer_ = nullptr;
@@ -667,12 +836,28 @@ private:
     enum class ScreenPowerStage { Awake, Dimmed, DeepDimmed };
     std::atomic<ScreenPowerStage> screen_power_stage_{ScreenPowerStage::Awake};
     std::atomic<int64_t> last_touch_tap_us_{0};
+    qmi8658_dev_t qmi8658_{};
+    std::atomic_bool shake_reaction_active_{false};
+    std::atomic_bool menu_open_{false};
+    std::atomic<int64_t> last_dizzy_voice_us_{0};
 
     enum class MenuPage { Closed, Settings, Volume };
+    enum class CaptureAction {
+        StartAudio,
+        StopAudio,
+        StartNotes,
+        StopNotesVoice,
+        StopNotesMenu,
+    };
+    struct CaptureActionContext {
+        WaveshareEsp32s3TouchAMOLED2inch16* board;
+        CaptureAction action;
+    };
     MenuPage menu_page_ = MenuPage::Closed;  // Application task only.
     int menu_selection_ = 0;
     int menu_volume_ = 0;
     std::atomic_bool menu_key_pending_{false};
+    std::atomic<uint32_t> capture_action_pending_{0};
 
     void StopDeepDimTimer() {
         esp_err_t ret = esp_timer_stop(deep_dim_timer_);
@@ -691,7 +876,98 @@ private:
     }
 
     void RefreshMenu(bool animate = false) {
-        display_->ShowMenu(menu_page_ == MenuPage::Volume, menu_selection_, menu_volume_, animate);
+        menu_open_.store(true);
+        display_->ShowMenu(menu_page_ == MenuPage::Volume, menu_selection_, menu_volume_,
+                           capture_storage_.IsAudioRecording(),
+                           capture_storage_.IsTextNotesActive(), animate);
+    }
+
+    static uint32_t CaptureActionBit(CaptureAction action) {
+        switch (action) {
+            case CaptureAction::StartAudio:
+            case CaptureAction::StopAudio:
+                return 1 << 0;
+            case CaptureAction::StartNotes:
+            case CaptureAction::StopNotesVoice:
+            case CaptureAction::StopNotesMenu:
+                return 1 << 1;
+        }
+        return 0;
+    }
+
+    void UpdateCaptureUi() {
+        const bool audio = capture_storage_.IsAudioRecording();
+        const bool notes = capture_storage_.IsTextNotesActive();
+        display_->SetCaptureState(audio, notes);
+        if (menu_page_ != MenuPage::Closed) {
+            RefreshMenu();
+        }
+        if (audio || notes) {
+            power_save_timer_->SetEnabled(false);
+        } else {
+            power_save_timer_->SetEnabled(pmic_->IsDischarging());
+        }
+    }
+
+    void CompleteCaptureAction(CaptureAction action, CaptureResult result) {
+        capture_action_pending_.fetch_and(~CaptureActionBit(action));
+        UpdateCaptureUi();
+        display_->ShowNotification(result.message.c_str());
+    }
+
+    std::string RequestCaptureAction(CaptureAction action) {
+        const uint32_t bit = CaptureActionBit(action);
+        if (capture_action_pending_.fetch_or(bit) & bit) {
+            return "同类操作正在处理中";
+        }
+
+        auto* context = new (std::nothrow) CaptureActionContext{this, action};
+        if (context == nullptr) {
+            capture_action_pending_.fetch_and(~bit);
+            return "内存不足，无法启动操作";
+        }
+        BaseType_t created = xTaskCreate(
+            [](void* argument) {
+                auto* context = static_cast<CaptureActionContext*>(argument);
+                auto* board = context->board;
+                const CaptureAction action = context->action;
+                auto& audio_service = Application::GetInstance().GetAudioService();
+                CaptureResult result;
+                switch (action) {
+                    case CaptureAction::StartAudio:
+                        result = board->capture_storage_.StartAudioRecording();
+                        if (result.ok) {
+                            audio_service.EnableLocalCapture(true);
+                        }
+                        break;
+                    case CaptureAction::StopAudio:
+                        audio_service.EnableLocalCapture(false);
+                        result = board->capture_storage_.StopAudioRecording();
+                        break;
+                    case CaptureAction::StartNotes:
+                        result = board->capture_storage_.StartTextNotes();
+                        break;
+                    case CaptureAction::StopNotesVoice:
+                        result = board->capture_storage_.StopTextNotes(true);
+                        break;
+                    case CaptureAction::StopNotesMenu:
+                        result = board->capture_storage_.StopTextNotes(false);
+                        break;
+                }
+                delete context;
+                Application::GetInstance().Schedule(
+                    [board, action, result = std::move(result)]() mutable {
+                        board->CompleteCaptureAction(action, std::move(result));
+                    });
+                vTaskDelete(nullptr);
+            },
+            "capture_control", 4096, context, 2, nullptr);
+        if (created != pdPASS) {
+            delete context;
+            capture_action_pending_.fetch_and(~bit);
+            return "无法创建存储操作任务";
+        }
+        return "操作已受理，请查看屏幕状态";
     }
 
     void HandleMenuKey(bool back) {
@@ -705,6 +981,7 @@ private:
                 RefreshMenu();
             } else if (menu_page_ == MenuPage::Settings) {
                 menu_page_ = MenuPage::Closed;
+                menu_open_.store(false);
                 display_->HideMenu();
             }
             return;
@@ -717,13 +994,193 @@ private:
             GetAudioCodec()->SetOutputVolume(menu_volume_);
             menu_page_ = MenuPage::Settings;
             RefreshMenu();
-        } else if (menu_selection_ == 0) {
-            menu_volume_ = std::clamp(GetAudioCodec()->output_volume(), 0, 100);
-            menu_page_ = MenuPage::Volume;
-            RefreshMenu();
         } else {
-            menu_page_ = MenuPage::Closed;
-            display_->HideMenu();
+            switch (menu_selection_) {
+                case 0:
+                    menu_volume_ = std::clamp(GetAudioCodec()->output_volume(), 0, 100);
+                    menu_page_ = MenuPage::Volume;
+                    RefreshMenu();
+                    break;
+                case 1:
+                    RequestCaptureAction(capture_storage_.IsAudioRecording()
+                                             ? CaptureAction::StopAudio
+                                             : CaptureAction::StartAudio);
+                    break;
+                case 2:
+                    RequestCaptureAction(capture_storage_.IsTextNotesActive()
+                                             ? CaptureAction::StopNotesMenu
+                                             : CaptureAction::StartNotes);
+                    break;
+                default:
+                    menu_page_ = MenuPage::Closed;
+                    menu_open_.store(false);
+                    display_->HideMenu();
+                    break;
+            }
+        }
+    }
+
+    bool IsShakeReactionAllowed() const {
+        if (screen_power_stage_.load() != ScreenPowerStage::Awake || menu_open_.load() ||
+            capture_storage_.IsAudioRecording() || capture_storage_.IsTextNotesActive()) {
+            return false;
+        }
+        auto state = Application::GetInstance().GetDeviceState();
+        return state == kDeviceStateIdle || state == kDeviceStateListening ||
+               state == kDeviceStateSpeaking;
+    }
+
+    void StartShakeReaction() {
+        if (!IsShakeReactionAllowed()) {
+            shake_reaction_active_.store(false);
+            return;
+        }
+
+        power_save_timer_->WakeUp();
+        display_->StartDizzy();
+
+#if WAVESHARE_DIZZY_SOUND_EMBEDDED
+        constexpr int64_t kVoiceCooldownUs = 5 * 1000 * 1000;
+        int64_t now = esp_timer_get_time();
+        if (now - last_dizzy_voice_us_.load() >= kVoiceCooldownUs &&
+            Application::GetInstance().TryPlayLocalReactionSound(kDizzySound)) {
+            last_dizzy_voice_us_.store(now);
+        }
+#endif
+    }
+
+    void StopShakeReaction() { display_->StopDizzy(); }
+
+    void InitializeMotionSensor() {
+        esp_err_t ret = qmi8658_init(&qmi8658_, i2c_bus_, QMI8658_ADDRESS_HIGH);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "QMI8658 unavailable; shake reaction disabled: %s", esp_err_to_name(ret));
+            return;
+        }
+        if ((ret = qmi8658_set_accel_range(&qmi8658_, QMI8658_ACCEL_RANGE_4G)) != ESP_OK ||
+            (ret = qmi8658_set_accel_odr(&qmi8658_, QMI8658_ACCEL_ODR_125HZ)) != ESP_OK ||
+            (ret = qmi8658_enable_sensors(&qmi8658_, QMI8658_ENABLE_ACCEL)) != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to configure QMI8658; shake reaction disabled: %s",
+                     esp_err_to_name(ret));
+            return;
+        }
+        qmi8658_set_accel_unit_mg(&qmi8658_, true);
+
+        BaseType_t result = xTaskCreate(
+            [](void* argument) {
+                auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch16*>(argument);
+                constexpr float kGravityAlpha = 0.90f;
+                constexpr float kShakeThresholdMg = 900.0f;
+                constexpr int64_t kPeakSpacingUs = 80 * 1000;
+                constexpr int64_t kPeakWindowUs = 600 * 1000;
+                constexpr int64_t kRecoveryUs = 2000 * 1000;
+
+                float gravity[3] = {};
+                float previous_peak[3] = {};
+                float previous_peak_magnitude = 0.0f;
+                bool gravity_initialized = false;
+                bool have_previous_peak = false;
+                int peak_count = 0;
+                int64_t peak_window_start_us = 0;
+                int64_t last_peak_us = 0;
+                int64_t last_motion_us = 0;
+
+                for (;;) {
+                    if (!board->IsShakeReactionAllowed()) {
+                        gravity_initialized = false;
+                        have_previous_peak = false;
+                        peak_count = 0;
+                        if (board->shake_reaction_active_.exchange(false)) {
+                            Application::GetInstance().Schedule(
+                                [board]() { board->StopShakeReaction(); });
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(20));
+                        continue;
+                    }
+
+                    float acceleration[3] = {};
+                    esp_err_t read_ret = qmi8658_read_accel(&board->qmi8658_, &acceleration[0],
+                                                            &acceleration[1], &acceleration[2]);
+                    if (read_ret != ESP_OK) {
+                        vTaskDelay(pdMS_TO_TICKS(20));
+                        continue;
+                    }
+
+                    if (!gravity_initialized) {
+                        for (int i = 0; i < 3; ++i) {
+                            gravity[i] = acceleration[i];
+                        }
+                        gravity_initialized = true;
+                        vTaskDelay(pdMS_TO_TICKS(20));
+                        continue;
+                    }
+
+                    float linear[3];
+                    float magnitude_squared = 0.0f;
+                    for (int i = 0; i < 3; ++i) {
+                        gravity[i] =
+                            kGravityAlpha * gravity[i] + (1.0f - kGravityAlpha) * acceleration[i];
+                        linear[i] = acceleration[i] - gravity[i];
+                        magnitude_squared += linear[i] * linear[i];
+                    }
+                    float magnitude = std::sqrt(magnitude_squared);
+                    int64_t now = esp_timer_get_time();
+
+                    if (board->shake_reaction_active_.load()) {
+                        if (magnitude >= kShakeThresholdMg &&
+                            now - last_peak_us >= kPeakSpacingUs) {
+                            last_peak_us = now;
+                            last_motion_us = now;
+                        }
+                        if (now - last_motion_us >= kRecoveryUs &&
+                            board->shake_reaction_active_.exchange(false)) {
+                            Application::GetInstance().Schedule(
+                                [board]() { board->StopShakeReaction(); });
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(20));
+                        continue;
+                    }
+
+                    if (magnitude >= kShakeThresholdMg && now - last_peak_us >= kPeakSpacingUs) {
+                        if (peak_count == 0 || now - peak_window_start_us > kPeakWindowUs) {
+                            peak_count = 0;
+                            have_previous_peak = false;
+                            peak_window_start_us = now;
+                        }
+
+                        float dot = linear[0] * previous_peak[0] + linear[1] * previous_peak[1] +
+                                    linear[2] * previous_peak[2];
+                        bool direction_alternates =
+                            !have_previous_peak ||
+                            dot < -0.15f * magnitude * previous_peak_magnitude;
+                        if (direction_alternates) {
+                            ++peak_count;
+                            for (int i = 0; i < 3; ++i) {
+                                previous_peak[i] = linear[i];
+                            }
+                            previous_peak_magnitude = magnitude;
+                            have_previous_peak = true;
+                            last_peak_us = now;
+                        }
+
+                        if (peak_count >= 3) {
+                            peak_count = 0;
+                            have_previous_peak = false;
+                            last_motion_us = now;
+                            board->shake_reaction_active_.store(true);
+                            Application::GetInstance().Schedule(
+                                [board]() { board->StartShakeReaction(); });
+                        }
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
+            },
+            "shake_sensor", 4096, this, 2, nullptr);
+        if (result != pdPASS) {
+            ESP_LOGW(TAG, "Failed to create shake sensor task");
+            qmi8658_enable_sensors(&qmi8658_, QMI8658_DISABLE_ALL);
+        } else {
+            ESP_LOGI(TAG, "QMI8658 shake reaction initialized");
         }
     }
 
@@ -735,7 +1192,7 @@ private:
         if (menu_page_ == MenuPage::Volume) {
             menu_volume_ = std::clamp(menu_volume_ + direction * 5, 0, 100);
         } else {
-            menu_selection_ = 1 - menu_selection_;
+            menu_selection_ = (menu_selection_ + (direction > 0 ? 1 : 3)) % 4;
         }
         RefreshMenu();
         return true;
@@ -1100,9 +1557,87 @@ private:
         ESP_LOGI(TAG, "Touch panel initialized successfully");
     }
 
+    void InitializeCaptureStorage() {
+        auto& audio_service = Application::GetInstance().GetAudioService();
+        audio_service.SetLocalCaptureCallback(
+            [this](const int16_t* samples, size_t sample_count, int channels) {
+                capture_storage_.PushPcm(samples, sample_count, channels);
+            });
+        capture_storage_.SetErrorCallback([this](const std::string& message) {
+            Application::GetInstance().Schedule([this, message]() {
+                if (!capture_storage_.IsAudioRecording()) {
+                    Application::GetInstance().GetAudioService().EnableLocalCapture(false);
+                }
+                UpdateCaptureUi();
+                display_->ShowNotification(message.c_str());
+            });
+        });
+
+        BaseType_t created = xTaskCreate(
+            [](void* argument) {
+                auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch16*>(argument);
+                CaptureResult result = board->capture_storage_.Initialize();
+                if (!result.ok) {
+                    ESP_LOGW(TAG, "%s", result.message.c_str());
+                }
+                vTaskDelete(nullptr);
+            },
+            "sd_mount", 4096, this, 2, nullptr);
+        if (created != pdPASS) {
+            ESP_LOGW(TAG, "Failed to create initial TF mount task");
+        }
+    }
+
     // 初始化工具
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
+        mcp_server.AddTool(
+            "self.audio_recording.start",
+            "Start local microphone recording to the TF card. Use for Chinese requests such as "
+            "'帮我录音' or '开始录音'. The device UI confirms recording; after calling this tool, "
+            "do not speak a confirmation because speaker audio may enter the recording.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                if (capture_storage_.IsAudioRecording()) {
+                    return std::string("已经在录音");
+                }
+                return RequestCaptureAction(CaptureAction::StartAudio);
+            });
+        mcp_server.AddTool(
+            "self.audio_recording.stop",
+            "Stop and save the current TF-card audio recording. Use for Chinese requests such as "
+            "'停止录音' or '保存录音'.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                if (!capture_storage_.IsAudioRecording()) {
+                    return std::string("当前没有录音");
+                }
+                return RequestCaptureAction(CaptureAction::StopAudio);
+            });
+        mcp_server.AddTool(
+            "self.text_notes.start",
+            "Start saving final user speech-to-text results to a UTF-8 text file on the TF card. "
+            "Use for Chinese requests such as '帮我记录一下' or '开始记录'.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                if (capture_storage_.IsTextNotesActive()) {
+                    return std::string("已经在记录文字");
+                }
+                return RequestCaptureAction(CaptureAction::StartNotes);
+            });
+        mcp_server.AddTool(
+            "self.text_notes.stop",
+            "Stop and save TF-card text notes. Use for Chinese requests such as '停止记录'. The "
+            "last STT line that triggered this tool is removed from the notes file.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                if (!capture_storage_.IsTextNotesActive()) {
+                    return std::string("当前没有文字记录");
+                }
+                return RequestCaptureAction(CaptureAction::StopNotesVoice);
+            });
+        mcp_server.AddTool(
+            "self.capture.get_status",
+            "Return TF-card mount, audio recording, text note, and file path status.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                return capture_storage_.GetStatusJson();
+            });
         mcp_server.AddTool("self.system.reconfigure_wifi",
                            "End this conversation and enter WiFi configuration mode.\n"
                            "**CAUTION** You must ask the user to confirm this action.",
@@ -1125,6 +1660,8 @@ public:
         InitializeDisplay();
         InitializeTouch();
         InitializeButtons();
+        InitializeMotionSensor();
+        InitializeCaptureStorage();
         InitializeTools();
     }
 
@@ -1146,7 +1683,8 @@ public:
         charging = pmic_->IsCharging();
         discharging = pmic_->IsDischarging();
         if (discharging != last_discharging) {
-            power_save_timer_->SetEnabled(discharging);
+            power_save_timer_->SetEnabled(discharging && !capture_storage_.IsAudioRecording() &&
+                                          !capture_storage_.IsTextNotesActive());
             last_discharging = discharging;
         }
 
@@ -1159,6 +1697,10 @@ public:
             power_save_timer_->WakeUp();
         }
         WifiBoard::SetPowerSaveLevel(level);
+    }
+
+    void OnUserTranscription(const std::string& text) override {
+        capture_storage_.AppendTranscript(text);
     }
 };
 

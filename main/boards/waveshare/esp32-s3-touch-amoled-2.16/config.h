@@ -2,6 +2,7 @@
 #define _BOARD_CONFIG_H_
 
 #include <driver/gpio.h>
+#include <driver/spi_master.h>
 
 #define AUDIO_INPUT_SAMPLE_RATE 24000
 #define AUDIO_OUTPUT_SAMPLE_RATE 24000
@@ -33,6 +34,12 @@
 #define EXAMPLE_PIN_NUM_LCD_DATA1 GPIO_NUM_5
 #define EXAMPLE_PIN_NUM_LCD_DATA2 GPIO_NUM_6
 #define EXAMPLE_PIN_NUM_LCD_DATA3 GPIO_NUM_7
+
+#define SD_SPI_HOST SPI3_HOST
+#define SD_MOSI_PIN GPIO_NUM_1
+#define SD_CLK_PIN GPIO_NUM_2
+#define SD_MISO_PIN GPIO_NUM_3
+#define SD_CS_PIN GPIO_NUM_41
 
 #define DISPLAY_WIDTH 480
 #define DISPLAY_HEIGHT 480

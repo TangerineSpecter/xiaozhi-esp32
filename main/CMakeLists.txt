@@ -1037,6 +1037,21 @@ endif()
 
 file(GLOB COMMON_SOUNDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/common/*.ogg)
 
+# The shake reaction voice is deliberately board-local. It is optional until
+# the user-provided, matching-voice clip is placed at this path.
+set(BOARD_SOUNDS "")
+set(WAVESHARE_DIZZY_SOUND_EMBEDDED OFF)
+if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_2_16)
+    set(WAVESHARE_DIZZY_SOUND
+        "${CMAKE_CURRENT_SOURCE_DIR}/boards/waveshare/esp32-s3-touch-amoled-2.16/assets/sounds/dizzy.ogg")
+    if(EXISTS "${WAVESHARE_DIZZY_SOUND}")
+        list(APPEND BOARD_SOUNDS "${WAVESHARE_DIZZY_SOUND}")
+        set(WAVESHARE_DIZZY_SOUND_EMBEDDED ON)
+    else()
+        message(STATUS "Waveshare dizzy voice asset not found; shake animation will be silent")
+    endif()
+endif()
+
 # If target chip is ESP32, exclude specific files to avoid build errors
 if(CONFIG_IDF_TARGET_ESP32)
     list(REMOVE_ITEM SOURCES "audio/codecs/box_audio_codec.cc"
@@ -1079,6 +1094,13 @@ if(CONFIG_BOARD_TYPE_ESP_SPOT_S3 OR CONFIG_BOARD_TYPE_ESP_SPOT_C5 OR CONFIG_BOAR
         espressif__bmi270_sensor
     )
 endif()
+if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_2_16)
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA
+        waveshare__qmi8658
+        esp_driver_sdspi
+        sdmmc
+    )
+endif()
 if(CONFIG_BOARD_TYPE_ESP_VOCAT AND IDF_VERSION_MAJOR LESS 6)
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA
         espressif__touch_slider_sensor
@@ -1092,7 +1114,7 @@ if(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD)
     )
 endif()
 idf_component_register(SRCS ${SOURCES}
-                    EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
+                    EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS} ${BOARD_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
                     WHOLE_ARCHIVE
                     PRIV_REQUIRES
@@ -1120,6 +1142,10 @@ idf_component_register(SRCS ${SOURCES}
                         xiaozhi-fonts
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
+
+if(WAVESHARE_DIZZY_SOUND_EMBEDDED)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE WAVESHARE_DIZZY_SOUND_EMBEDDED=1)
+endif()
 
 # Keep project-owned C++ on GNU C++23. ESP-IDF 6 may default to a newer
 # dialect; pin the baseline so main/ does not depend on it.

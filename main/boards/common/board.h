@@ -82,6 +82,9 @@ public:
     virtual void SetPowerSaveLevel(PowerSaveLevel level) = 0;
     virtual std::string GetBoardJson() = 0;
     virtual std::string GetDeviceStatusJson() = 0;
+    // Optional hook for board-local features that persist final user STT results.
+    // Called on the application task; implementations must not block on storage I/O.
+    virtual void OnUserTranscription(const std::string& text) { (void)text; }
 };
 
 #define DECLARE_BOARD(BOARD_CLASS_NAME) \

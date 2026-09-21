@@ -51,6 +51,7 @@
 #define AS_EVENT_AUDIO_TESTING_RUNNING (1 << 0)
 #define AS_EVENT_WAKE_WORD_RUNNING (1 << 1)
 #define AS_EVENT_AUDIO_PROCESSOR_RUNNING (1 << 2)
+#define AS_EVENT_LOCAL_CAPTURE_RUNNING (1 << 3)
 #define AS_EVENT_AUDIO_INPUT_STOP_REQUEST (1 << 4)
 
 #define AS_OPUS_GET_FRAME_DRU_ENUM(duration_ms)                  \
@@ -138,6 +139,12 @@ public:
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
+    void SetLocalCaptureCallback(
+        std::function<void(const int16_t* samples, size_t sample_count, int channels)> callback);
+    void EnableLocalCapture(bool enable);
+    bool IsLocalCaptureRunning() const {
+        return xEventGroupGetBits(event_group_) & AS_EVENT_LOCAL_CAPTURE_RUNNING;
+    }
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
@@ -151,6 +158,7 @@ public:
 private:
     AudioCodec* codec_ = nullptr;
     AudioServiceCallbacks callbacks_;
+    std::function<void(const int16_t*, size_t, int)> local_capture_callback_;
     std::unique_ptr<AudioEngine> audio_engine_;
     std::unique_ptr<AudioDebugger> audio_debugger_;
     void* opus_encoder_ = nullptr;

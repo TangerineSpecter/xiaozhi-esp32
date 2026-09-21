@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>小智 2.16 录音与记录交互预览</title>
+        <link rel="stylesheet" href="styles.css" />
+    </head>
+    <body>
+        <main class="workbench">
+            <header class="intro">
+                <p class="eyebrow">WAVESHARE · 480 × 480 UI PROTOTYPE</p>
+                <h1>录音与记录<br /><span>硬件交互预览台</span></h1>
+                <p class="lede">
+                    页面复用固件角色和房间资源，并按照实体三键规则运行。先在这里确认视觉与交互，再同步回 LVGL。
+                </p>
+            </header>
+
+            <section class="device-stage" aria-label="设备屏幕模拟器">
+                <div class="device-shadow"></div>
+                <div class="device-shell">
+                    <div class="screen" id="screen">
+                        <img class="room" src="../assets/background/room.png" alt="房间背景" />
+
+                        <div class="stamina-hud">
+                            <span class="heart">♥</span>
+                            <div class="stamina-copy">
+                                <strong>86</strong>
+                                <span class="stamina-track"><i></i></span>
+                            </div>
+                        </div>
+
+                        <div class="voice-status"><i></i><span id="voiceStatus">待命</span></div>
+
+                        <div class="speech-bubble" id="speechBubble">
+                            <p id="speechText">按中键打开设置，试试录音和文字记录。</p>
+                            <span class="speech-tail"></span>
+                        </div>
+
+                        <div class="character-wrap">
+                            <img
+                                id="character"
+                                class="character"
+                                src="../assets/emoji/neutral.png"
+                                alt="小智角色"
+                            />
+                        </div>
+
+                        <div class="recording-badge" id="recordingBadge" hidden>
+                            <span class="rec-dot"></span>
+                            <strong>REC</strong>
+                            <time id="recordingTime">00:00</time>
+                            <span class="wave" aria-hidden="true"><i></i><i></i><i></i></span>
+                        </div>
+
+                        <div class="notes-badge" id="notesBadge" hidden>
+                            <span class="note-icon" aria-hidden="true">✎</span>
+                            <strong>记录中</strong>
+                        </div>
+
+                        <div class="toast" id="toast" hidden></div>
+
+                        <div class="menu-overlay" id="menuOverlay" hidden>
+                            <section class="menu-panel" aria-label="设置菜单">
+                                <h2 id="menuTitle">设置</h2>
+                                <div class="menu-grid" id="menuGrid">
+                                    <button class="menu-card selected" data-index="0" type="button">
+                                        <span class="menu-icon volume-icon">◖</span>
+                                        <strong>音量</strong>
+                                    </button>
+                                    <button class="menu-card" data-index="1" type="button">
+                                        <span class="menu-icon">●</span>
+                                        <strong id="audioMenuLabel">录音</strong>
+                                    </button>
+                                    <button class="menu-card" data-index="2" type="button">
+                                        <span class="menu-icon">✎</span>
+                                        <strong id="notesMenuLabel">记录</strong>
+                                    </button>
+                                    <button class="menu-card" data-index="3" type="button">
+                                        <span class="menu-icon">↩</span>
+                                        <strong>返回</strong>
+                                    </button>
+                                </div>
+                                <div class="volume-page" id="volumePage" hidden>
+                                    <output id="volumeValue">70%</output>
+                                    <div class="volume-track"><i id="volumeFill"></i></div>
+                                </div>
+                                <p class="menu-hint" id="menuHint">
+                                    上 / 下 选择 · 中键确认<br />长按中键 2 秒返回
+                                </p>
+                            </section>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="hardware-controls" aria-label="硬件三键模拟">
+                    <button class="hardware-key" id="upButton" type="button">
+                        <span class="key-symbol">↑</span>
+                        <span class="key-name">上键</span>
+                    </button>
+                    <button class="hardware-key primary" id="centerButton" type="button">
+                        <span class="hold-ring"></span>
+                        <span class="key-symbol">●</span>
+                        <span class="key-name">中键</span>
+                        <small>长按返回</small>
+                    </button>
+                    <button class="hardware-key" id="downButton" type="button">
+                        <span class="key-symbol">↓</span>
+                        <span class="key-name">下键</span>
+                    </button>
+                </div>
+            </section>
+
+            <aside class="inspector">
+                <div class="inspector-heading">
+                    <span>LIVE STATE</span>
+                    <button id="resetButton" type="button">重置</button>
+                </div>
+                <dl class="state-list">
+                    <div><dt>页面</dt><dd id="statePage">主界面</dd></div>
+                    <div><dt>录音</dt><dd id="stateAudio" class="off">未启动</dd></div>
+                    <div><dt>文字记录</dt><dd id="stateNotes" class="off">未启动</dd></div>
+                    <div><dt>角色资源</dt><dd id="stateCharacter">neutral.png</dd></div>
+                    <div><dt>音量</dt><dd id="stateVolume">70%</dd></div>
+                </dl>
+
+                <section class="rule-card">
+                    <span class="rule-number">01</span>
+                    <div><strong>同硬件菜单</strong><p>四项循环选择，中键执行；录音和记录互不排斥。</p></div>
+                </section>
+                <section class="rule-card">
+                    <span class="rule-number">02</span>
+                    <div><strong>状态优先级</strong><p>录音角色优先于记录角色，两个状态徽标同时保留。</p></div>
+                </section>
+                <section class="rule-card muted">
+                    <span class="rule-number">03</span>
+                    <div><strong>回放尚未接入</strong><p>此预览先忠实反映当前固件，录音播放将在交互确认后设计。</p></div>
+                </section>
+
+                <p class="keyboard-tip">键盘也可操作：<kbd>↑</kbd> <kbd>↓</kbd> <kbd>Enter</kbd>，按住 <kbd>Enter</kbd> 模拟长按。</p>
+            </aside>
+        </main>
+
+        <script src="app.js"></script>
+    </body>
+</html>

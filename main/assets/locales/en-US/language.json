@@ -54,6 +54,8 @@
         "FOUND_NEW_ASSETS": "Found new assets: %s",
         "DOWNLOAD_ASSETS_FAILED": "Failed to download assets",
         "LOADING_ASSETS": "Loading assets...",
-        "HELLO_MY_FRIEND": "Hello, my friend!"
+        "HELLO_MY_FRIEND": "Hello, my friend!",
+        "TOOL_GET_WEATHER": "Let me check the weather...",
+        "TOOL_SEARCH_NEWS": "Let me search for the latest news..."
     }
 }

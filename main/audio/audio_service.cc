@@ -118,6 +118,7 @@ void AudioService::Start() {
     service_stopped_.store(false);
     xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
                                            AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+                                           AS_EVENT_LOCAL_CAPTURE_RUNNING |
                                            AS_EVENT_AUDIO_INPUT_STOP_REQUEST);
 
     esp_timer_start_periodic(audio_power_timer_, 1000000);
@@ -174,7 +175,8 @@ void AudioService::Stop() {
     esp_timer_stop(audio_power_timer_);
     service_stopped_.store(true);
     xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
-                                         AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+                                         AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+                                         AS_EVENT_LOCAL_CAPTURE_RUNNING);
 
     bool notify_drained = false;
     {
@@ -240,9 +242,9 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
 }
 
 void AudioService::AudioInputTask() {
-    constexpr EventBits_t kAudioInputActiveBits = AS_EVENT_AUDIO_TESTING_RUNNING |
-                                                  AS_EVENT_WAKE_WORD_RUNNING |
-                                                  AS_EVENT_AUDIO_PROCESSOR_RUNNING;
+    constexpr EventBits_t kAudioInputActiveBits =
+        AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
+        AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_LOCAL_CAPTURE_RUNNING;
 
     while (true) {
         EventBits_t bits = xEventGroupWaitBits(
@@ -307,11 +309,17 @@ void AudioService::AudioInputTask() {
         }
 
         /* Feed the selected audio engine */
-        if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
+        if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+                    AS_EVENT_LOCAL_CAPTURE_RUNNING)) {
             int samples = 160;  // 10ms
             std::vector<int16_t> data;
             if (ReadAudioData(data, 16000, samples)) {
-                audio_engine_->Feed(std::move(data));
+                if ((bits & AS_EVENT_LOCAL_CAPTURE_RUNNING) && local_capture_callback_) {
+                    local_capture_callback_(data.data(), data.size(), codec_->input_channels());
+                }
+                if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
+                    audio_engine_->Feed(std::move(data));
+                }
                 continue;
             }
         }
@@ -748,6 +756,20 @@ void AudioService::EnableAudioTesting(bool enable) {
     }
 }
 
+void AudioService::SetLocalCaptureCallback(
+    std::function<void(const int16_t* samples, size_t sample_count, int channels)> callback) {
+    local_capture_callback_ = std::move(callback);
+}
+
+void AudioService::EnableLocalCapture(bool enable) {
+    ESP_LOGI(TAG, "%s local audio capture", enable ? "Enabling" : "Disabling");
+    if (enable) {
+        xEventGroupSetBits(event_group_, AS_EVENT_LOCAL_CAPTURE_RUNNING);
+    } else {
+        xEventGroupClearBits(event_group_, AS_EVENT_LOCAL_CAPTURE_RUNNING);
+    }
+}
+
 void AudioService::EnableDeviceAec(bool enable) {
     ESP_LOGI(TAG, "%s device AEC", enable ? "Enabling" : "Disabling");
     device_aec_enabled_ = enable;
@@ -787,7 +809,8 @@ void AudioService::PlaySound(const std::string_view& ogg) {
 
 bool AudioService::IsIdle() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    return audio_encode_queue_.empty() && IsPlaybackDrainedLocked() && audio_testing_queue_.empty();
+    return !IsLocalCaptureRunning() && audio_encode_queue_.empty() && IsPlaybackDrainedLocked() &&
+           audio_testing_queue_.empty();
 }
 
 bool AudioService::IsPlaybackIdle() {
