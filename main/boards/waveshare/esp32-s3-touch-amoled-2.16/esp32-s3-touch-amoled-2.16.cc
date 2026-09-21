@@ -861,7 +861,7 @@ private:
     int menu_selection_ = 0;
     int menu_volume_ = 0;
     std::atomic_bool menu_key_pending_{false};
-    std::atomic<uint32_t> capture_action_pending_{0};
+    std::atomic_bool capture_action_pending_{false};
 
     void StopDeepDimTimer() {
         esp_err_t ret = esp_timer_stop(deep_dim_timer_);
@@ -879,6 +879,18 @@ private:
         return true;
     }
 
+    bool HasActiveCapture() const {
+        return capture_storage_.IsAudioRecording() || capture_storage_.IsTextNotesActive();
+    }
+
+    bool IsCaptureBusy() const { return capture_action_pending_.load() || HasActiveCapture(); }
+
+    void CloseMenu() {
+        menu_page_ = MenuPage::Closed;
+        menu_open_.store(false);
+        display_->HideMenu();
+    }
+
     void RefreshMenu(bool animate = false) {
         menu_open_.store(true);
         display_->ShowMenu(menu_page_ == MenuPage::Volume, menu_selection_, menu_volume_,
@@ -886,24 +898,13 @@ private:
                            capture_storage_.IsTextNotesActive(), animate);
     }
 
-    static uint32_t CaptureActionBit(CaptureAction action) {
-        switch (action) {
-            case CaptureAction::StartAudio:
-            case CaptureAction::StopAudio:
-                return 1 << 0;
-            case CaptureAction::StartNotes:
-            case CaptureAction::StopNotesVoice:
-            case CaptureAction::StopNotesMenu:
-                return 1 << 1;
-        }
-        return 0;
-    }
-
     void UpdateCaptureUi() {
         const bool audio = capture_storage_.IsAudioRecording();
         const bool notes = capture_storage_.IsTextNotesActive();
         display_->SetCaptureState(audio, notes);
-        if (menu_page_ != MenuPage::Closed) {
+        if (audio || notes) {
+            CloseMenu();
+        } else if (menu_page_ != MenuPage::Closed) {
             RefreshMenu();
         }
         if (audio || notes) {
@@ -914,20 +915,26 @@ private:
     }
 
     void CompleteCaptureAction(CaptureAction action, CaptureResult result) {
-        capture_action_pending_.fetch_and(~CaptureActionBit(action));
+        (void)action;
+        capture_action_pending_.store(false);
         UpdateCaptureUi();
         display_->ShowNotification(result.message.c_str());
     }
 
     std::string RequestCaptureAction(CaptureAction action) {
-        const uint32_t bit = CaptureActionBit(action);
-        if (capture_action_pending_.fetch_or(bit) & bit) {
-            return "同类操作正在处理中";
+        if (action == CaptureAction::StartAudio && capture_storage_.IsTextNotesActive()) {
+            return "正在文字记录，请先结束记录";
+        }
+        if (action == CaptureAction::StartNotes && capture_storage_.IsAudioRecording()) {
+            return "正在录音，请先结束录音";
+        }
+        if (capture_action_pending_.exchange(true)) {
+            return "存储操作正在处理中";
         }
 
         auto* context = new (std::nothrow) CaptureActionContext{this, action};
         if (context == nullptr) {
-            capture_action_pending_.fetch_and(~bit);
+            capture_action_pending_.store(false);
             return "内存不足，无法启动操作";
         }
         BaseType_t created = xTaskCreate(
@@ -968,13 +975,28 @@ private:
             "capture_control", 4096, context, 2, nullptr);
         if (created != pdPASS) {
             delete context;
-            capture_action_pending_.fetch_and(~bit);
+            capture_action_pending_.store(false);
             return "无法创建存储操作任务";
         }
         return "操作已受理，请查看屏幕状态";
     }
 
+    void StopActiveCapture() {
+        if (capture_storage_.IsAudioRecording()) {
+            RequestCaptureAction(CaptureAction::StopAudio);
+        } else if (capture_storage_.IsTextNotesActive()) {
+            RequestCaptureAction(CaptureAction::StopNotesMenu);
+        }
+    }
+
     void HandleMenuKey(bool back) {
+        if (IsCaptureBusy()) {
+            power_save_timer_->WakeUp();
+            if (HasActiveCapture()) {
+                StopActiveCapture();
+            }
+            return;
+        }
         if (WakeDisplayIfSleeping()) {
             return;
         }
@@ -984,9 +1006,7 @@ private:
                 menu_page_ = MenuPage::Settings;
                 RefreshMenu();
             } else if (menu_page_ == MenuPage::Settings) {
-                menu_page_ = MenuPage::Closed;
-                menu_open_.store(false);
-                display_->HideMenu();
+                CloseMenu();
             }
             return;
         }
@@ -1006,19 +1026,19 @@ private:
                     RefreshMenu();
                     break;
                 case 1:
+                    CloseMenu();
                     RequestCaptureAction(capture_storage_.IsAudioRecording()
                                              ? CaptureAction::StopAudio
                                              : CaptureAction::StartAudio);
                     break;
                 case 2:
+                    CloseMenu();
                     RequestCaptureAction(capture_storage_.IsTextNotesActive()
                                              ? CaptureAction::StopNotesMenu
                                              : CaptureAction::StartNotes);
                     break;
                 default:
-                    menu_page_ = MenuPage::Closed;
-                    menu_open_.store(false);
-                    display_->HideMenu();
+                    CloseMenu();
                     break;
             }
         }
@@ -1209,6 +1229,9 @@ private:
 
     bool HandleMenuDirection(int direction) {
         power_save_timer_->WakeUp();
+        if (IsCaptureBusy()) {
+            return true;
+        }
         if (menu_page_ == MenuPage::Closed) {
             return false;
         }
@@ -1428,6 +1451,13 @@ private:
         });
         boot_button_.OnClick([this]() {
             Application::GetInstance().Schedule([this]() {
+                if (IsCaptureBusy()) {
+                    power_save_timer_->WakeUp();
+                    if (HasActiveCapture()) {
+                        StopActiveCapture();
+                    }
+                    return;
+                }
                 if (WakeDisplayIfSleeping()) {
                     return;
                 }
@@ -1445,6 +1475,13 @@ private:
 
         boot_button_.OnDoubleClick([this]() {
             Application::GetInstance().Schedule([this]() {
+                if (IsCaptureBusy()) {
+                    power_save_timer_->WakeUp();
+                    if (HasActiveCapture()) {
+                        StopActiveCapture();
+                    }
+                    return;
+                }
                 if (WakeDisplayIfSleeping()) {
                     return;
                 }

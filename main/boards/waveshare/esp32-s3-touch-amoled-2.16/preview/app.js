@@ -83,7 +83,8 @@ function updateStateLabel(element, enabled, onText) {
 }
 
 function render() {
-    const menuOpen = state.page !== "closed";
+    const captureActive = state.audio || state.notes;
+    const menuOpen = state.page !== "closed" && !captureActive;
     const volumeOpen = state.page === "volume";
     const [characterSrc, characterName] = currentCharacter();
 
@@ -109,12 +110,10 @@ function render() {
 
     if (state.audio) {
         elements.voiceStatus.textContent = "录音中";
-        elements.speechText.textContent = state.notes
-            ? "正在录音，同时记录识别到的文字。"
-            : "录音进行中，说“停止录音”或从菜单停止。";
+        elements.speechText.textContent = "录音进行中，点击对话按钮或菜单按钮结束。";
     } else if (state.notes) {
         elements.voiceStatus.textContent = "等待识别";
-        elements.speechText.textContent = "文字记录进行中，联网识别结果会持续写入 TF 卡。";
+        elements.speechText.textContent = "文字记录进行中，点击对话按钮或菜单按钮结束。";
     } else {
         elements.voiceStatus.textContent = state.chatListening ? "聆听中" : "待命";
         elements.speechText.textContent = state.chatListening
@@ -122,23 +121,50 @@ function render() {
             : "按中键打开设置，试试录音和文字记录。";
     }
 
-    elements.statePage.textContent =
-        state.page === "closed" ? "主界面" : state.page === "settings" ? "设置菜单" : "音量设置";
+    elements.statePage.textContent = captureActive
+        ? "主界面"
+        : state.page === "closed"
+          ? "主界面"
+          : state.page === "settings"
+            ? "设置菜单"
+            : "音量设置";
     updateStateLabel(elements.stateAudio, state.audio, "录音中");
     updateStateLabel(elements.stateNotes, state.notes, "记录中");
     elements.stateCharacter.textContent = characterName;
     elements.stateVolume.textContent = `${state.volume}%`;
 }
 
+function stopCapture() {
+    const wasAudio = state.audio;
+    const wasNotes = state.notes;
+    state.audio = false;
+    state.notes = false;
+    state.recordingStartedAt = 0;
+    state.page = "closed";
+    if (wasAudio) {
+        showToast("录音已保存到 TF 卡");
+    } else if (wasNotes) {
+        showToast("文字记录已保存到 TF 卡");
+    }
+    state.chatListening = false;
+    render();
+}
+
 function move(direction) {
     if (state.page === "closed") {
         if (direction < 0) {
+            if (state.audio || state.notes) {
+                stopCapture();
+                return;
+            }
             state.chatListening = !state.chatListening;
             showToast(state.chatListening ? "开始聆听" : "结束聆听");
         }
         render();
         return;
     }
+
+    if (state.audio || state.notes) return;
 
     if (state.page === "volume") {
         state.volume = Math.min(100, Math.max(0, state.volume + direction * 5));
@@ -149,6 +175,11 @@ function move(direction) {
 }
 
 function confirm() {
+    if (state.audio || state.notes) {
+        stopCapture();
+        return;
+    }
+
     if (state.page === "closed") {
         state.page = "settings";
         state.selection = 0;
@@ -168,17 +199,17 @@ function confirm() {
             state.page = "volume";
             break;
         case 1:
-            state.audio = !state.audio;
-            if (state.audio) {
-                state.recordingStartedAt = Date.now();
-                showToast("录音已开始");
-            } else {
-                showToast("录音已保存到 TF 卡");
-            }
+            state.audio = true;
+            state.notes = false;
+            state.page = "closed";
+            state.recordingStartedAt = Date.now();
+            showToast("录音已开始");
             break;
         case 2:
-            state.notes = !state.notes;
-            showToast(state.notes ? "文字记录已开始" : "文字记录已保存");
+            state.audio = false;
+            state.notes = true;
+            state.page = "closed";
+            showToast("文字记录已开始");
             break;
         default:
             state.page = "closed";
@@ -188,6 +219,11 @@ function confirm() {
 }
 
 function goBack() {
+    if (state.audio || state.notes) {
+        stopCapture();
+        return;
+    }
+
     if (state.page === "volume") {
         state.page = "settings";
         showToast("已取消音量调整");
@@ -218,7 +254,11 @@ function startCenterHold(event) {
     holdTimer = window.setTimeout(() => {
         holdTriggered = true;
         elements.centerButton.classList.remove("holding");
-        goBack();
+        if (state.audio || state.notes) {
+            stopCapture();
+        } else {
+            goBack();
+        }
     }, 2000);
 }
 
