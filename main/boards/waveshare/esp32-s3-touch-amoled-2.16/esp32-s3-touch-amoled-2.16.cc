@@ -22,6 +22,7 @@
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_timer.h>
+#include <dirent.h>
 #include "esp_io_expander_tca9554.h"
 #include "settings.h"
 #include "settings_menu.h"
@@ -34,12 +35,15 @@
 #include <lvgl.h>
 #include <material_symbols.h>
 
+#include <sys/stat.h>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <new>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch16"
 
@@ -178,6 +182,7 @@ private:
     std::string speech_text_;
     size_t speech_offset_ = 0;
     bool dizzy_active_ = false;
+    bool petting_active_ = false;
     bool recording_active_ = false;
     bool notes_active_ = false;
     int64_t recording_started_us_ = 0;
@@ -512,15 +517,17 @@ private:
     }
 
 public:
-    void ShowMenu(bool editing, int selected, int volume, bool audio_recording, bool notes_active,
-                  bool animate = false) {
+    void ShowMenu(SettingsMenu::Page page, int selected, int volume, bool audio_recording,
+                  bool notes_active, const std::vector<SettingsMenu::FileItem>& files,
+                  const std::string& preview, bool playing, bool animate = false) {
         DisplayLockGuard lock(this);
         if (current_theme_ == nullptr) {
             return;
         }
         auto* theme = static_cast<LvglTheme*>(current_theme_);
         menu_.Create(display_, theme->text_font()->font(), theme->icon_font()->font());
-        menu_.Show(editing, selected, volume, audio_recording, notes_active, animate);
+        menu_.Show(page, selected, volume, audio_recording, notes_active, files, preview, playing,
+                   animate);
     }
 
     SettingsMenu::TouchTarget HitTestMenuTouch(lv_coord_t x, lv_coord_t y) const {
@@ -736,14 +743,14 @@ public:
     virtual void SetEmotion(const char* emotion) override {
         const char* requested = emotion != nullptr && emotion[0] != '\0' ? emotion : "neutral";
         pending_emotion_ = requested;
-        if (dizzy_active_ || recording_active_ || notes_active_) {
+        if (dizzy_active_ || petting_active_ || recording_active_ || notes_active_) {
             return;
         }
         ApplyEmotion(requested);
     }
 
     void StartDizzy() {
-        if (dizzy_active_ || recording_active_ || notes_active_) {
+        if (dizzy_active_ || petting_active_ || recording_active_ || notes_active_) {
             return;
         }
         dizzy_active_ = true;
@@ -764,11 +771,47 @@ public:
         }
     }
 
+    void StartPetting() {
+        if (dizzy_active_ || recording_active_ || notes_active_) {
+            return;
+        }
+        petting_active_ = true;
+        ApplyEmotion("petting");
+    }
+
+    void StopPetting() {
+        if (!petting_active_) {
+            return;
+        }
+        petting_active_ = false;
+        if (recording_active_) {
+            ApplyEmotion("recording");
+        } else if (notes_active_) {
+            ApplyEmotion("taking_notes");
+        } else if (dizzy_active_) {
+            ApplyEmotion("dizzy");
+        } else {
+            ApplyEmotion(pending_emotion_.empty() ? "neutral" : pending_emotion_.c_str());
+        }
+    }
+
+    bool HitTestCharacterHead(lv_coord_t x, lv_coord_t y) const {
+        constexpr lv_coord_t kHeadLeft = DISPLAY_WIDTH * 28 / 100;
+        constexpr lv_coord_t kHeadRight = DISPLAY_WIDTH * 72 / 100;
+        constexpr lv_coord_t kCharacterTop = DISPLAY_HEIGHT - kEmotionImageSize;
+        constexpr lv_coord_t kHeadTop = kCharacterTop + kEmotionImageSize * 4 / 100;
+        constexpr lv_coord_t kHeadBottom = kHeadTop + kEmotionImageSize * 43 / 100;
+        return x >= kHeadLeft && x <= kHeadRight && y >= kHeadTop && y <= kHeadBottom;
+    }
+
     void SetCaptureState(bool audio_recording, bool text_notes) {
         bool capture_changed = recording_active_ != audio_recording || notes_active_ != text_notes;
         bool recording_started = !recording_active_ && audio_recording;
         recording_active_ = audio_recording;
         notes_active_ = text_notes;
+        if (recording_active_ || notes_active_) {
+            petting_active_ = false;
+        }
         if (recording_started) {
             recording_started_us_ = esp_timer_get_time();
         }
@@ -832,6 +875,7 @@ private:
     esp_io_expander_handle_t io_expander = NULL;
     PowerSaveTimer* power_save_timer_;
     esp_timer_handle_t deep_dim_timer_ = nullptr;
+    esp_timer_handle_t petting_timer_ = nullptr;
     esp_timer_handle_t emergency_restart_timer_ = nullptr;
     std::atomic_bool key3_pressed_{false};
     std::atomic_bool boot_pressed_{false};
@@ -842,10 +886,11 @@ private:
     std::atomic<int64_t> last_touch_tap_us_{0};
     qmi8658_dev_t qmi8658_{};
     std::atomic_bool shake_reaction_active_{false};
+    std::atomic_bool petting_reaction_active_{false};
     std::atomic_bool menu_open_{false};
     std::atomic<int64_t> last_dizzy_voice_us_{0};
 
-    enum class MenuPage { Closed, Settings, Volume };
+    enum class MenuPage { Closed, Settings, Volume, Files, AudioFiles, NotesFiles };
     enum class CaptureAction {
         StartAudio,
         StopAudio,
@@ -857,11 +902,99 @@ private:
         WaveshareEsp32s3TouchAMOLED2inch16* board;
         CaptureAction action;
     };
+    struct FileTaskContext {
+        WaveshareEsp32s3TouchAMOLED2inch16* board;
+        MenuPage page;
+        std::string path;
+        uint32_t generation = 0;
+    };
+    struct WavInfo {
+        long data_offset = 0;
+        uint32_t data_size = 0;
+        uint32_t sample_rate = 0;
+        uint16_t channels = 0;
+        uint16_t bits_per_sample = 0;
+    };
     MenuPage menu_page_ = MenuPage::Closed;  // Application task only.
     int menu_selection_ = 0;
     int menu_volume_ = 0;
+    std::vector<SettingsMenu::FileItem> menu_files_;
+    std::vector<std::string> menu_file_paths_;
     std::atomic_bool menu_key_pending_{false};
     std::atomic_bool capture_action_pending_{false};
+    std::atomic_bool file_action_pending_{false};
+    std::atomic_bool playback_active_{false};
+    std::atomic_uint32_t playback_generation_{0};
+
+    static uint16_t ReadLe16(const uint8_t* data) {
+        return static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
+    }
+
+    static uint32_t ReadLe32(const uint8_t* data) {
+        return static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8) |
+               (static_cast<uint32_t>(data[2]) << 16) | (static_cast<uint32_t>(data[3]) << 24);
+    }
+
+    static bool ReadWavInfo(FILE* file, WavInfo& info) {
+        uint8_t header[12];
+        if (std::fread(header, 1, sizeof(header), file) != sizeof(header) ||
+            std::memcmp(header, "RIFF", 4) != 0 || std::memcmp(header + 8, "WAVE", 4) != 0) {
+            return false;
+        }
+
+        bool found_format = false;
+        while (!std::feof(file)) {
+            uint8_t chunk[8];
+            if (std::fread(chunk, 1, sizeof(chunk), file) != sizeof(chunk)) {
+                break;
+            }
+            const uint32_t size = ReadLe32(chunk + 4);
+            if (std::memcmp(chunk, "fmt ", 4) == 0) {
+                if (size < 16 || size > 128) {
+                    return false;
+                }
+                std::array<uint8_t, 128> format = {};
+                if (std::fread(format.data(), 1, size, file) != size ||
+                    ReadLe16(format.data()) != 1) {
+                    return false;
+                }
+                info.channels = ReadLe16(format.data() + 2);
+                info.sample_rate = ReadLe32(format.data() + 4);
+                info.bits_per_sample = ReadLe16(format.data() + 14);
+                found_format = true;
+            } else if (std::memcmp(chunk, "data", 4) == 0) {
+                info.data_offset = std::ftell(file);
+                info.data_size = size;
+                return found_format;
+            } else if (std::fseek(file, size + (size & 1U), SEEK_CUR) != 0) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    static std::string FileDisplayName(const std::string& path) {
+        const size_t slash = path.find_last_of('/');
+        if (slash == std::string::npos) {
+            return path;
+        }
+        const size_t parent_slash = path.find_last_of('/', slash - 1);
+        return parent_slash == std::string::npos ? path.substr(slash + 1)
+                                                 : path.substr(parent_slash + 1);
+    }
+
+    static std::string TruncateUtf8(std::string text, size_t maximum) {
+        if (text.size() <= maximum) {
+            return text;
+        }
+        size_t end = maximum;
+        while (end > 0 && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) {
+            --end;
+        }
+        text.resize(end);
+        text.append("…");
+        return text;
+    }
 
     void StopDeepDimTimer() {
         esp_err_t ret = esp_timer_stop(deep_dim_timer_);
@@ -883,19 +1016,389 @@ private:
         return capture_storage_.IsAudioRecording() || capture_storage_.IsTextNotesActive();
     }
 
+    bool IsPettingReactionAllowed() const {
+        return screen_power_stage_.load() == ScreenPowerStage::Awake && !menu_open_.load() &&
+               !capture_action_pending_.load() && !HasActiveCapture() &&
+               !shake_reaction_active_.load();
+    }
+
+    void StopPettingTimer() {
+        if (petting_timer_ == nullptr) {
+            return;
+        }
+        esp_err_t ret = esp_timer_stop(petting_timer_);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Failed to stop petting timer: %s", esp_err_to_name(ret));
+        }
+    }
+
+    void StopPettingReaction() {
+        StopPettingTimer();
+        if (petting_reaction_active_.exchange(false)) {
+            display_->StopPetting();
+        }
+    }
+
+    void StartPettingReaction() {
+        if (!IsPettingReactionAllowed()) {
+            StopPettingReaction();
+            return;
+        }
+        power_save_timer_->WakeUp();
+        petting_reaction_active_.store(true);
+        display_->StartPetting();
+        StopPettingTimer();
+        esp_err_t ret = esp_timer_start_once(petting_timer_, 980 * 1000);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to start petting timer: %s", esp_err_to_name(ret));
+            StopPettingReaction();
+        }
+    }
+
+    void InitializePettingReaction() {
+        esp_timer_create_args_t timer_args = {
+            .callback =
+                [](void* arg) {
+                    auto* board = static_cast<WaveshareEsp32s3TouchAMOLED2inch16*>(arg);
+                    Application::GetInstance().Schedule(
+                        [board]() { board->StopPettingReaction(); });
+                },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "petting_reaction",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &petting_timer_));
+    }
+
     bool IsCaptureBusy() const { return capture_action_pending_.load() || HasActiveCapture(); }
 
+    void UpdatePowerSavePolicy() {
+        power_save_timer_->SetEnabled(pmic_->IsDischarging() && !HasActiveCapture() &&
+                                      !playback_active_.load());
+    }
+
+    static void CollectFiles(const std::string& directory, const char* extension,
+                             std::vector<std::string>& paths) {
+        DIR* dir = opendir(directory.c_str());
+        if (dir == nullptr) {
+            return;
+        }
+        while (auto* entry = readdir(dir)) {
+            if (std::strcmp(entry->d_name, ".") == 0 || std::strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            const std::string path = directory + "/" + entry->d_name;
+            struct stat status = {};
+            if (stat(path.c_str(), &status) != 0) {
+                continue;
+            }
+            if (S_ISDIR(status.st_mode)) {
+                CollectFiles(path, extension, paths);
+            } else if (S_ISREG(status.st_mode)) {
+                const size_t path_length = path.size();
+                const size_t extension_length = std::strlen(extension);
+                if (path_length >= extension_length &&
+                    path.compare(path_length - extension_length, extension_length, extension) ==
+                        0) {
+                    paths.push_back(path);
+                }
+            }
+        }
+        closedir(dir);
+    }
+
+    static std::string ReadNotePreview(const std::string& path) {
+        FILE* file = std::fopen(path.c_str(), "rb");
+        if (file == nullptr) {
+            return "无法读取记录";
+        }
+        std::array<char, 513> buffer = {};
+        const size_t length = std::fread(buffer.data(), 1, buffer.size() - 1, file);
+        std::fclose(file);
+        std::string text(buffer.data(), length);
+        return text.empty() ? "（空记录）" : TruncateUtf8(std::move(text), 480);
+    }
+
+    static std::string GetFileDetail(const std::string& path, MenuPage page) {
+        struct stat status = {};
+        if (stat(path.c_str(), &status) != 0) {
+            return "无法读取";
+        }
+        if (page == MenuPage::AudioFiles) {
+            FILE* file = std::fopen(path.c_str(), "rb");
+            WavInfo info;
+            const bool valid = file != nullptr && ReadWavInfo(file, info) && info.channels == 1 &&
+                               info.bits_per_sample == 16 && info.sample_rate == 16000;
+            if (file != nullptr) {
+                std::fclose(file);
+            }
+            if (!valid) {
+                return "不支持的 WAV";
+            }
+            const uint32_t seconds = info.data_size / (info.sample_rate * 2U);
+            char detail[32];
+            std::snprintf(detail, sizeof(detail), "%02lu:%02lu · 16 kHz",
+                          static_cast<unsigned long>(seconds / 60),
+                          static_cast<unsigned long>(seconds % 60));
+            return detail;
+        }
+        char detail[32];
+        std::snprintf(detail, sizeof(detail), "%ld 字节", static_cast<long>(status.st_size));
+        return detail;
+    }
+
+    void CompleteFileLoad(MenuPage page, std::vector<SettingsMenu::FileItem> files,
+                          std::vector<std::string> paths, std::string error) {
+        file_action_pending_.store(false);
+        if (!error.empty()) {
+            display_->ShowNotification(error.c_str());
+            return;
+        }
+        if (menu_page_ != page) {
+            return;
+        }
+        menu_files_ = std::move(files);
+        menu_file_paths_ = std::move(paths);
+        menu_selection_ = 0;
+        RefreshMenu();
+    }
+
+    void LoadFiles(MenuPage page) {
+        if (file_action_pending_.exchange(true)) {
+            display_->ShowNotification("正在读取 TF 卡");
+            return;
+        }
+        menu_page_ = page;
+        menu_selection_ = 0;
+        menu_files_.clear();
+        menu_file_paths_.clear();
+        RefreshMenu();
+
+        auto* context = new (std::nothrow) FileTaskContext{this, page, {}, 0};
+        if (context == nullptr) {
+            file_action_pending_.store(false);
+            display_->ShowNotification("内存不足，无法读取文件");
+            return;
+        }
+        BaseType_t created = xTaskCreate(
+            [](void* argument) {
+                auto* context = static_cast<FileTaskContext*>(argument);
+                auto* board = context->board;
+                const MenuPage page = context->page;
+                delete context;
+
+                std::vector<SettingsMenu::FileItem> files;
+                std::vector<std::string> paths;
+                std::string error;
+                CaptureResult mounted = board->capture_storage_.Initialize();
+                if (!mounted.ok) {
+                    error = mounted.message;
+                } else {
+                    DIR* mount_directory = opendir("/sdcard");
+                    if (mount_directory == nullptr) {
+                        error = "TF 卡访问失败，请重新插卡";
+                    } else {
+                        closedir(mount_directory);
+                        const char* category = page == MenuPage::AudioFiles ? "audio" : "notes";
+                        const char* extension = page == MenuPage::AudioFiles ? ".wav" : ".txt";
+                        std::vector<std::string> all_paths;
+                        CollectFiles(std::string("/sdcard/xiaozhi/") + category, extension,
+                                     all_paths);
+                        std::sort(all_paths.begin(), all_paths.end(), std::greater<std::string>());
+                        if (all_paths.size() > 3) {
+                            all_paths.resize(3);
+                        }
+                        for (const auto& path : all_paths) {
+                            SettingsMenu::FileItem item;
+                            item.name = FileDisplayName(path);
+                            item.detail = GetFileDetail(path, page);
+                            if (page == MenuPage::NotesFiles) {
+                                item.preview = ReadNotePreview(path);
+                            }
+                            files.push_back(std::move(item));
+                            paths.push_back(path);
+                        }
+                    }
+                }
+                Application::GetInstance().Schedule([board, page, files = std::move(files),
+                                                     paths = std::move(paths),
+                                                     error = std::move(error)]() mutable {
+                    board->CompleteFileLoad(page, std::move(files), std::move(paths),
+                                            std::move(error));
+                });
+                vTaskDelete(nullptr);
+            },
+            "sd_file_list", 6144, context, 2, nullptr);
+        if (created != pdPASS) {
+            delete context;
+            file_action_pending_.store(false);
+            display_->ShowNotification("无法创建文件读取任务");
+        }
+    }
+
+    void CompletePlayback(uint32_t generation, std::string message) {
+        if (generation != playback_generation_.load()) {
+            return;
+        }
+        playback_active_.store(false);
+        UpdatePowerSavePolicy();
+        if (!message.empty()) {
+            display_->ShowNotification(message.c_str());
+        }
+        if (menu_page_ == MenuPage::AudioFiles) {
+            RefreshMenu();
+        }
+    }
+
+    void StopAudioPlayback(bool refresh = true) {
+        if (!playback_active_.exchange(false)) {
+            return;
+        }
+        playback_generation_.fetch_add(1);
+        Application::GetInstance().GetAudioService().ResetDecoder();
+        UpdatePowerSavePolicy();
+        if (refresh && menu_page_ == MenuPage::AudioFiles) {
+            RefreshMenu();
+        }
+    }
+
+    void StartAudioPlayback() {
+        if (menu_selection_ < 0 || menu_selection_ >= static_cast<int>(menu_file_paths_.size())) {
+            display_->ShowNotification("没有可播放的录音");
+            return;
+        }
+        if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
+            display_->ShowNotification("请先结束当前对话");
+            return;
+        }
+        if (playback_active_.load()) {
+            StopAudioPlayback();
+            return;
+        }
+
+        const uint32_t generation = playback_generation_.fetch_add(1) + 1;
+        auto* context = new (std::nothrow) FileTaskContext{
+            this, MenuPage::AudioFiles, menu_file_paths_[menu_selection_], generation};
+        if (context == nullptr) {
+            display_->ShowNotification("内存不足，无法播放录音");
+            return;
+        }
+        playback_active_.store(true);
+        power_save_timer_->SetEnabled(false);
+        RefreshMenu();
+        BaseType_t created = xTaskCreate(
+            [](void* argument) {
+                auto* context = static_cast<FileTaskContext*>(argument);
+                auto* board = context->board;
+                const std::string path = std::move(context->path);
+                const uint32_t generation = context->generation;
+                delete context;
+
+                std::string error;
+                FILE* file = std::fopen(path.c_str(), "rb");
+                WavInfo info;
+                if (file == nullptr || !ReadWavInfo(file, info) || info.channels != 1 ||
+                    info.bits_per_sample != 16 || info.sample_rate != 16000) {
+                    error = "录音格式不受支持";
+                } else if (std::fseek(file, info.data_offset, SEEK_SET) != 0) {
+                    error = "无法读取录音";
+                } else {
+                    auto& audio_service = Application::GetInstance().GetAudioService();
+                    std::array<int16_t, 640> input = {};
+                    uint32_t remaining = info.data_size;
+                    while (remaining > 0 && generation == board->playback_generation_.load()) {
+                        if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
+                            audio_service.ResetDecoder();
+                            error = "播放已中断";
+                            break;
+                        }
+                        const size_t requested =
+                            std::min<size_t>(input.size(), remaining / sizeof(int16_t));
+                        const size_t read =
+                            std::fread(input.data(), sizeof(int16_t), requested, file);
+                        if (read == 0) {
+                            if (std::ferror(file)) {
+                                error = "读取录音失败";
+                            }
+                            break;
+                        }
+                        remaining -= read * sizeof(int16_t);
+                        std::vector<int16_t> output;
+                        output.reserve((read * 3 + 1) / 2);
+                        size_t i = 0;
+                        for (; i + 1 < read; i += 2) {
+                            output.push_back(input[i]);
+                            output.push_back(static_cast<int16_t>(
+                                (static_cast<int32_t>(input[i]) + input[i + 1]) / 2));
+                            output.push_back(input[i + 1]);
+                        }
+                        if (i < read) {
+                            output.push_back(input[i]);
+                        }
+                        if (!audio_service.PushPcmToPlaybackQueue(std::move(output), true)) {
+                            if (generation == board->playback_generation_.load()) {
+                                error = "播放已中断";
+                            }
+                            break;
+                        }
+                    }
+                    while (error.empty() && generation == board->playback_generation_.load() &&
+                           !audio_service.IsPlaybackIdle()) {
+                        if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
+                            audio_service.ResetDecoder();
+                            error = "播放已中断";
+                            break;
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(20));
+                    }
+                }
+                if (file != nullptr) {
+                    std::fclose(file);
+                }
+                Application::GetInstance().Schedule(
+                    [board, generation, error = std::move(error)]() mutable {
+                        board->CompletePlayback(generation, std::move(error));
+                    });
+                vTaskDelete(nullptr);
+            },
+            "wav_playback", 6144, context, 2, nullptr);
+        if (created != pdPASS) {
+            delete context;
+            playback_active_.store(false);
+            UpdatePowerSavePolicy();
+            display_->ShowNotification("无法创建播放任务");
+            RefreshMenu();
+        }
+    }
+
     void CloseMenu() {
+        StopAudioPlayback(false);
         menu_page_ = MenuPage::Closed;
         menu_open_.store(false);
         display_->HideMenu();
     }
 
     void RefreshMenu(bool animate = false) {
+        StopPettingReaction();
         menu_open_.store(true);
-        display_->ShowMenu(menu_page_ == MenuPage::Volume, menu_selection_, menu_volume_,
-                           capture_storage_.IsAudioRecording(),
-                           capture_storage_.IsTextNotesActive(), animate);
+        SettingsMenu::Page page = SettingsMenu::Page::Settings;
+        if (menu_page_ == MenuPage::Volume) {
+            page = SettingsMenu::Page::Volume;
+        } else if (menu_page_ == MenuPage::Files) {
+            page = SettingsMenu::Page::Files;
+        } else if (menu_page_ == MenuPage::AudioFiles) {
+            page = SettingsMenu::Page::AudioFiles;
+        } else if (menu_page_ == MenuPage::NotesFiles) {
+            page = SettingsMenu::Page::NotesFiles;
+        }
+        const std::string preview = menu_page_ == MenuPage::NotesFiles && menu_selection_ >= 0 &&
+                                            menu_selection_ < static_cast<int>(menu_files_.size())
+                                        ? menu_files_[menu_selection_].preview
+                                        : std::string();
+        display_->ShowMenu(page, menu_selection_, menu_volume_, capture_storage_.IsAudioRecording(),
+                           capture_storage_.IsTextNotesActive(), menu_files_, preview,
+                           playback_active_.load(), animate);
     }
 
     void UpdateCaptureUi() {
@@ -910,7 +1413,7 @@ private:
         if (audio || notes) {
             power_save_timer_->SetEnabled(false);
         } else {
-            power_save_timer_->SetEnabled(pmic_->IsDischarging());
+            UpdatePowerSavePolicy();
         }
     }
 
@@ -989,6 +1492,38 @@ private:
         }
     }
 
+    void HandleAudioRecordingShortcut() {
+        // GPIO18 is also part of the emergency-restart chord. Do not start or stop a
+        // recording while BOOT is held with it.
+        if (boot_pressed_.load()) {
+            return;
+        }
+        if (WakeDisplayIfSleeping()) {
+            return;
+        }
+        if (menu_page_ != MenuPage::Closed) {
+            return;
+        }
+
+        power_save_timer_->WakeUp();
+        if (capture_action_pending_.load()) {
+            display_->ShowNotification("存储操作正在处理中");
+            return;
+        }
+        if (capture_storage_.IsTextNotesActive()) {
+            display_->ShowNotification("正在文字记录，请先结束记录");
+            return;
+        }
+
+        StopPettingReaction();
+        const std::string result =
+            RequestCaptureAction(capture_storage_.IsAudioRecording() ? CaptureAction::StopAudio
+                                                                     : CaptureAction::StartAudio);
+        if (!capture_action_pending_.load()) {
+            display_->ShowNotification(result.c_str());
+        }
+    }
+
     void HandleMenuKey(bool back) {
         if (IsCaptureBusy()) {
             power_save_timer_->WakeUp();
@@ -1005,6 +1540,17 @@ private:
             if (menu_page_ == MenuPage::Volume) {
                 menu_page_ = MenuPage::Settings;
                 RefreshMenu();
+            } else if (menu_page_ == MenuPage::AudioFiles || menu_page_ == MenuPage::NotesFiles) {
+                StopAudioPlayback(false);
+                menu_page_ = MenuPage::Files;
+                menu_selection_ = 0;
+                menu_files_.clear();
+                menu_file_paths_.clear();
+                RefreshMenu();
+            } else if (menu_page_ == MenuPage::Files) {
+                menu_page_ = MenuPage::Settings;
+                menu_selection_ = 3;
+                RefreshMenu();
             } else if (menu_page_ == MenuPage::Settings) {
                 CloseMenu();
             }
@@ -1018,7 +1564,7 @@ private:
             GetAudioCodec()->SetOutputVolume(menu_volume_);
             menu_page_ = MenuPage::Settings;
             RefreshMenu();
-        } else {
+        } else if (menu_page_ == MenuPage::Settings) {
             switch (menu_selection_) {
                 case 0:
                     menu_volume_ = std::clamp(GetAudioCodec()->output_volume(), 0, 100);
@@ -1038,14 +1584,34 @@ private:
                                              : CaptureAction::StartNotes);
                     break;
                 default:
-                    CloseMenu();
+                    menu_page_ = MenuPage::Files;
+                    menu_selection_ = 0;
+                    menu_files_.clear();
+                    menu_file_paths_.clear();
+                    RefreshMenu();
                     break;
+            }
+        } else if (menu_page_ == MenuPage::Files) {
+            LoadFiles(menu_selection_ == 0 ? MenuPage::AudioFiles : MenuPage::NotesFiles);
+        } else if (menu_page_ == MenuPage::AudioFiles) {
+            StartAudioPlayback();
+        } else if (menu_page_ == MenuPage::NotesFiles) {
+            if (menu_files_.empty()) {
+                display_->ShowNotification("没有可查看的记录");
             }
         }
     }
 
     void HandleMenuTouch(const SettingsMenu::TouchTarget& target) {
         if (!menu_open_.load()) {
+            return;
+        }
+        if (target.close) {
+            CloseMenu();
+            return;
+        }
+        if (target.back) {
+            HandleMenuKey(true);
             return;
         }
         if (target.outside) {
@@ -1060,12 +1626,24 @@ private:
         if (menu_page_ == MenuPage::Settings && target.menu_index >= 0) {
             menu_selection_ = target.menu_index;
             HandleMenuKey(false);
+        } else if (menu_page_ == MenuPage::Files && target.menu_index >= 0) {
+            menu_selection_ = target.menu_index;
+            HandleMenuKey(false);
+        } else if ((menu_page_ == MenuPage::AudioFiles || menu_page_ == MenuPage::NotesFiles) &&
+                   target.file_index >= 0 &&
+                   target.file_index < static_cast<int>(menu_files_.size())) {
+            if (menu_page_ == MenuPage::AudioFiles && menu_selection_ != target.file_index) {
+                StopAudioPlayback(false);
+            }
+            menu_selection_ = target.file_index;
+            RefreshMenu();
         }
     }
 
     bool IsShakeReactionAllowed() const {
         if (screen_power_stage_.load() != ScreenPowerStage::Awake || menu_open_.load() ||
-            capture_storage_.IsAudioRecording() || capture_storage_.IsTextNotesActive()) {
+            capture_storage_.IsAudioRecording() || capture_storage_.IsTextNotesActive() ||
+            petting_reaction_active_.load()) {
             return false;
         }
         auto state = Application::GetInstance().GetDeviceState();
@@ -1229,7 +1807,7 @@ private:
 
     bool HandleMenuDirection(int direction) {
         power_save_timer_->WakeUp();
-        if (IsCaptureBusy()) {
+        if (IsCaptureBusy() || file_action_pending_.load()) {
             return true;
         }
         if (menu_page_ == MenuPage::Closed) {
@@ -1237,6 +1815,17 @@ private:
         }
         if (menu_page_ == MenuPage::Volume) {
             menu_volume_ = std::clamp(menu_volume_ + direction * 5, 0, 100);
+        } else if (menu_page_ == MenuPage::Files) {
+            menu_selection_ = (menu_selection_ + 1) % 2;
+        } else if (menu_page_ == MenuPage::AudioFiles || menu_page_ == MenuPage::NotesFiles) {
+            if (menu_files_.empty()) {
+                return true;
+            }
+            if (menu_page_ == MenuPage::AudioFiles) {
+                StopAudioPlayback(false);
+            }
+            const int count = static_cast<int>(menu_files_.size());
+            menu_selection_ = (menu_selection_ + (direction > 0 ? 1 : count - 1)) % count;
         } else {
             menu_selection_ = (menu_selection_ + (direction > 0 ? 1 : 3)) % 4;
         }
@@ -1449,6 +2038,9 @@ private:
                 HandleMenuDirection(1);
             });
         });
+        key3_button_.OnLongPress([this]() {
+            Application::GetInstance().Schedule([this]() { HandleAudioRecordingShortcut(); });
+        });
         boot_button_.OnClick([this]() {
             Application::GetInstance().Schedule([this]() {
                 if (IsCaptureBusy()) {
@@ -1512,16 +2104,18 @@ private:
         auto stage = board->screen_power_stage_.load();
         if (stage == ScreenPowerStage::Awake) {
             board->last_touch_tap_us_.store(0);
+            lv_indev_t* indev = lv_indev_get_act();
+            if (indev == nullptr) {
+                return;
+            }
+            lv_point_t point = {};
+            lv_indev_get_point(indev, &point);
             if (board->menu_open_.load()) {
-                lv_indev_t* indev = lv_indev_get_act();
-                if (indev == nullptr) {
-                    return;
-                }
-                lv_point_t point = {};
-                lv_indev_get_point(indev, &point);
                 const auto target = board->display_->HitTestMenuTouch(point.x, point.y);
                 Application::GetInstance().Schedule(
                     [board, target]() { board->HandleMenuTouch(target); });
+            } else if (board->display_->HitTestCharacterHead(point.x, point.y)) {
+                Application::GetInstance().Schedule([board]() { board->StartPettingReaction(); });
             }
             return;
         }
@@ -1720,7 +2314,7 @@ private:
 
 public:
     WaveshareEsp32s3TouchAMOLED2inch16()
-        : key3_button_(KEY3_BUTTON_GPIO), boot_button_(BOOT_BUTTON_GPIO) {
+        : key3_button_(KEY3_BUTTON_GPIO, false, 1000), boot_button_(BOOT_BUTTON_GPIO) {
         InitializePowerSaveTimer();
         InitializeCodecI2c();
 #if CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_AMOLED_1_75
@@ -1729,6 +2323,7 @@ public:
         InitializeAxp2101();
         InitializeSpi();
         InitializeDisplay();
+        InitializePettingReaction();
         InitializeTouch();
         InitializeButtons();
         InitializeMotionSensor();
@@ -1754,8 +2349,7 @@ public:
         charging = pmic_->IsCharging();
         discharging = pmic_->IsDischarging();
         if (discharging != last_discharging) {
-            power_save_timer_->SetEnabled(discharging && !capture_storage_.IsAudioRecording() &&
-                                          !capture_storage_.IsTextNotesActive());
+            UpdatePowerSavePolicy();
             last_discharging = discharging;
         }
 

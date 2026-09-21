@@ -10,6 +10,7 @@
 - `sad.png`：难过
 - `angry.png`：生气
 - `sleepy.png`：睡觉
+- `petting.png`：点击角色头部时短暂显示的闭眼微笑表情
 - `recording.png`：录音中，角色将麦克风递向屏幕外的用户；REC 点、声波、计时和状态徽标由 LVGL 单独绘制
 - `taking_notes.png`：文字记录中，角色手持笔记本和笔进行记录；“记录中”徽标由 LVGL 单独绘制
 - `dizzy.gif`：摇晃触发的眩晕动画，以 `neutral.png` 原始像素生成全部帧

@@ -38,6 +38,8 @@
                         </div>
 
                         <div class="character-wrap">
+                            <button id="headHitArea" class="head-hit-area" type="button" aria-label="摸摸头">
+                            </button>
                             <img
                                 id="character"
                                 class="character"
@@ -62,10 +64,26 @@
 
                         <div class="menu-overlay" id="menuOverlay" hidden>
                             <section class="menu-panel" aria-label="设置菜单">
+                                <button class="menu-back" id="menuBack" type="button" aria-label="返回">
+                                    <svg class="back-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                        <path d="m14.5 5-7 7 7 7" />
+                                    </svg>
+                                    <strong>返回</strong>
+                                </button>
+                                <button class="menu-close" id="menuClose" type="button" aria-label="关闭菜单">
+                                    <svg class="close-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                        <path d="m7 7 10 10M17 7 7 17" />
+                                    </svg>
+                                    <strong>关闭</strong>
+                                </button>
                                 <h2 id="menuTitle">设置</h2>
                                 <div class="menu-grid" id="menuGrid">
                                     <button class="menu-card selected" data-index="0" type="button">
-                                        <span class="menu-icon volume-icon">◖</span>
+                                        <svg class="menu-icon volume-icon" viewBox="0 0 48 48" aria-hidden="true">
+                                            <path d="M6 18h9l10-8v28l-10-8H6z" />
+                                            <path d="M31 17.5c2.5 2.2 3.8 4.7 3.8 7.5s-1.3 5.3-3.8 7.5" />
+                                            <path d="M36.5 11.5c4.2 3.8 6.5 8.1 6.5 13.5s-2.3 9.7-6.5 13.5" />
+                                        </svg>
                                         <strong>音量</strong>
                                     </button>
                                     <button class="menu-card" data-index="1" type="button">
@@ -77,13 +95,53 @@
                                         <strong id="notesMenuLabel">记录</strong>
                                     </button>
                                     <button class="menu-card" data-index="3" type="button">
-                                        <span class="menu-icon">↩</span>
-                                        <strong>返回</strong>
+                                        <svg class="menu-icon folder-icon" viewBox="0 0 48 48" aria-hidden="true">
+                                            <path d="M5 14h14l4 5h20v19H5z" />
+                                            <path d="M5 19h38" />
+                                        </svg>
+                                        <strong>文件</strong>
                                     </button>
                                 </div>
                                 <div class="volume-page" id="volumePage" hidden>
                                     <output id="volumeValue">70%</output>
                                     <div class="volume-track"><i id="volumeFill"></i></div>
+                                </div>
+                                <div class="file-page" id="filesPage" hidden>
+                                    <button class="file-card" data-file-page="audio-files" type="button">
+                                        <span class="file-card-icon">▶</span>
+                                        <strong>播放录音</strong>
+                                        <small>3 个文件</small>
+                                    </button>
+                                    <button class="file-card" data-file-page="notes-files" type="button">
+                                        <svg class="file-card-svg" viewBox="0 0 48 48" aria-hidden="true">
+                                            <path d="M11 5h18l8 8v30H11z" />
+                                            <path d="M29 5v9h8M17 23h14M17 30h14M17 37h9" />
+                                        </svg>
+                                        <strong>查看记录</strong>
+                                        <small>3 个文件</small>
+                                    </button>
+                                </div>
+                                <div class="library-page" id="audioFilesPage" hidden>
+                                    <div class="library-heading">
+                                        <span>录音文件</span>
+                                        <small>最近优先</small>
+                                    </div>
+                                    <div class="file-list" id="audioList"></div>
+                                    <div class="audio-player-status" id="audioPlayerStatus">
+                                        <i></i>
+                                        <span>中键播放选中录音</span>
+                                    </div>
+                                </div>
+                                <div class="library-page" id="notesFilesPage" hidden>
+                                    <div class="library-heading">
+                                        <span>文字记录</span>
+                                        <small>最近优先</small>
+                                    </div>
+                                    <div class="file-list" id="notesList"></div>
+                                    <article class="note-preview">
+                                        <span>内容预览</span>
+                                        <p id="notePreviewText"></p>
+                                    </article>
                                 </div>
                                 <p class="menu-hint" id="menuHint">
                                     上 / 下 选择 · 中键确认<br />长按中键 2 秒返回
@@ -95,8 +153,10 @@
 
                 <div class="hardware-controls" aria-label="硬件三键模拟">
                     <button class="hardware-key" id="upButton" type="button">
+                        <span class="hold-ring"></span>
                         <span class="key-symbol">↑</span>
                         <span class="key-name">上键</span>
+                        <small>长按录音</small>
                     </button>
                     <button class="hardware-key primary" id="centerButton" type="button">
                         <span class="hold-ring"></span>
@@ -130,11 +190,11 @@
                 </section>
                 <section class="rule-card">
                     <span class="rule-number">02</span>
-                    <div><strong>任务独占</strong><p>启动后菜单关闭，回到人物界面；对话按钮或菜单按钮结束任务。</p></div>
+                    <div><strong>任务独占</strong><p>启动后菜单关闭；录音可长按上键停止，也可用对话或菜单按钮结束任务。</p></div>
                 </section>
                 <section class="rule-card muted">
                     <span class="rule-number">03</span>
-                    <div><strong>回放尚未接入</strong><p>此预览先忠实反映当前固件，录音播放将在交互确认后设计。</p></div>
+                    <div><strong>文件原型</strong><p>录音回放和记录查看先用模拟文件，确认交互后再同步到 TF 卡。</p></div>
                 </section>
 
                 <p class="keyboard-tip">键盘也可操作：<kbd>↑</kbd> <kbd>↓</kbd> <kbd>Enter</kbd>，按住 <kbd>Enter</kbd> 模拟长按。</p>
